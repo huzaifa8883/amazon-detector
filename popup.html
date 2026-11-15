@@ -1,0 +1,40 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Amazon Jobs Signal Detector</title><link rel="stylesheet" href="popup.css"></head><body><main>
+<header><div class="logo">◉</div><div><h1>Amazon Jobs Detector</h1><p>Public listings · Oracle Signal Hub</p></div><span class="version" id="extensionVersion">v0.5.8</span></header>
+<section class="state"><div class="state-row"><span id="dot" class="dot"></span><b id="runStatus">LOADING</b></div><p id="statusDetail"></p></section>
+<section class="panel"><h2>Connect your detector</h2><label for="deviceToken">Your Oracle detector API key</label>
+<input id="deviceToken" type="password" placeholder="Paste the key you were assigned" autocomplete="off" spellcheck="false"/>
+<p class="hint">Only your individual key is required. Your detector identity and settings come from Oracle. Leave the field blank to check your saved connection.</p>
+<button id="save" class="primary">Save &amp; Connect</button>
+<div class="profile"><div><span>Detector ID</span><b id="detectorId">—</b></div><div><span>Assigned UK seconds</span><b id="seconds">—</b></div><div><span>Schedule</span><b id="schedule">—</b></div><div><span>Profile status</span><b id="profileStatus">—</b></div></div>
+</section>
+<section class="metrics"><div><span>Cards visible</span><strong id="cards">—</strong></div><div><span>Observations</span><strong id="changes">—</strong></div><div><span>Pending</span><strong id="pending">—</strong></div></section>
+<p id="cardDiagnostic" class="hint" aria-live="polite"></p>
+<section class="panel compact"><h2>Card detection diagnostics</h2><div class="profile">
+<div><span>Raw candidates</span><b id="rawCandidates">0</b></div>
+<div><span>Complete cards parsed</span><b id="parsedCards">0</b></div>
+<div><span>Ambiguous cards</span><b id="ambiguousCards">0</b></div>
+<div><span>Rejected candidates</span><b id="rejectedCards">0</b></div>
+<div><span>Queued observations</span><b id="queuedObservations">0</b></div>
+<div><span>Submitted attempts</span><b id="sentObservations">0</b></div>
+<div><span>Accepted by Oracle</span><b id="acceptedObservations">0</b></div>
+<div><span>Rejected sequence records (local archive)</span><b id="rejectedObservations">0</b></div>
+</div><p class="hint" id="rejectionDetails"></p></section>
+<section class="panel compact"><h2>Availability evidence (local)</h2><div class="profile">
+<div><span>Appearances</span><b id="appearances">0</b></div>
+<div><span>Meaningful text changes</span><b id="cardChanges">0</b></div>
+<div><span>Provisional missing</span><b id="provisional">0</b></div>
+<div><span>Confirmed absent (this detector)</span><b id="confirmed">0</b></div>
+<div><span>Reappearances</span><b id="reappearances">0</b></div>
+<div><span>Last DOM mutation (UK)</span><b id="mutationAt">—</b></div>
+<div><span>Comparable complete scan</span><b id="scanComplete">—</b></div>
+<div><span>Local audit records pending Oracle upgrade</span><b id="auditPending">0</b></div>
+<div><span>Audit overflow (older records lost)</span><b id="auditOverflow">0</b></div>
+</div><p class="hint">Appearance and disappearance are local evidence, not proof of available shifts. Audit records are NOT uploaded until Oracle publishes and verifies a compatible endpoint.</p></section>
+<section class="controls"><button id="start" class="primary">▶ Start Monitoring</button><button id="stop" class="secondary">■ Stop</button></section>
+<p id="feedback" role="status" aria-live="polite"></p>
+<section class="panel compact"><h2>Monitoring status</h2>
+<div class="profile"><div><span>Current page</span><b id="pageState">—</b></div><div><span>Last card scan (UK)</span><b id="lastScan">—</b></div><div><span>Automated page refresh</span><b id="nextRefresh">—</b></div><div><span>Last page refresh (legacy)</span><b id="lastRefresh">—</b></div><div><span>Refresh count (legacy)</span><b id="refreshCount">0</b></div><div><span>Last heartbeat</span><b id="heartbeatAt">—</b></div><div><span>Last heartbeat state</span><b id="heartbeatState">—</b></div><div><span>CAPTCHA / access signal</span><b id="safetySignal">—</b></div><div><span>Challenge detected (UK)</span><b id="safetyAt">—</b></div><div><span>Oracle heartbeat accepted (UK)</span><b id="safetyAckAt">—</b></div><div><span>Heartbeat HTTP status</span><b id="heartbeatHttp">—</b></div><div><span>Last Oracle delivery</span><b id="lastDelivery">—</b></div><div><span>Last API status</span><b id="http">—</b></div></div><p class="hint" id="result"></p>
+</section>
+<p class="hint">Oracle acknowledgement means the detector-health HTTP request was accepted; it does not prove that Telegram sent an alert.</p>
+<p class="hint">Keep Chrome and the public Amazon Jobs page open. Scheduled times are targets, not guaranteed exact execution. Monitoring pauses on CAPTCHA, access restrictions or invalid credentials. Only use permitted website access.</p>
+</main><script src="src/core.js"></script><script src="popup.js"></script></body></html>
