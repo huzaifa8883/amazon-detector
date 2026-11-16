@@ -4,100 +4,289 @@ import 'dotenv/config';
 import axios from 'axios';
 import { wrapper } from 'axios-cookiejar-support';
 import { CookieJar } from 'tough-cookie';
+import { WebSocketServer, WebSocket } from 'ws';
 
-import fs from 'node:fs/promises';
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const E = process.env;
 
-const BASE = E.API_BASE_URL;
-const CSRF_PATH = E.CSRF_PATH || '/csrf?countryCode=UK';
-const AUTH_PATH = E.AUTH_PATH || '/authorize?countryCode=UK';
-const GRAPHQL_PATH = E.GRAPHQL_PATH || '/graphql';
+const BASE_URL = 'https://www.jobsatamazon.co.uk';
 
-const TIMEOUT_MS = 20000;
-const POLL_MS = Math.max(
-  15 * 60 * 1000,
-  Number(E.POLL_MS || 900000)
-);
+const CONFIG = {
+  port: Number(E.PORT || 5002),
+  host: E.BIND_HOST || '127.0.0.1',
 
-const sleep = ms =>
-  new Promise(resolve => setTimeout(resolve, ms));
+  wsPort: Number(E.WS_PORT || 8082),
+  wsHost: E.WS_HOST || '127.0.0.1',
+
+  csrfPath: E.CSRF_PATH || '/csrf?countryCode=UK',
+  authorizePath:
+    E.AUTH_PATH || '/authorize?countryCode=UK',
+  graphqlPath: E.GRAPHQL_PATH || '/graphql',
+
+  // The actual GraphQL operation must be supplied.
+  graphqlQuery: E.GRAPHQL_QUERY || '',
+  graphqlOperation: E.GRAPHQL_OPERATION || '',
+  graphqlJobsPath: E.GRAPHQL_JOBS_PATH || '',
+
+  minScan: Math.max(
+    900000,
+    Number(E.MIN_SCAN_MS || 900000)
+  ),
+
+  maxScan: Math.max(
+    1800000,
+    Number(E.MAX_SCAN_MS || 1800000)
+  ),
+
+  requestTimeout: 25000,
+
+  maxRetryDelay: 3600000,
+
+  csrfHeader:
+    E.CSRF_REQUEST_HEADER || 'x-csrf-token',
+
+  csrfResponseHeader:
+    E.CSRF_RESPONSE_HEADER || 'x-csrf-token',
+
+  csrfCookieName: E.CSRF_COOKIE_NAME || '',
+
+  enableAuthorize:
+    E.ENABLE_AUTHORIZE === 'true',
+
+  alertExisting:
+    E.ALERT_EXISTING === 'true',
+
+  stateFile: path.join(ROOT, 'seen_jobs.json')
+};
 
 const now = () => new Date().toISOString();
 
 function log(event, details = {}) {
   console.log(JSON.stringify({
-    timestamp: now(),
-    service: 'amazon-api-detector',
+    time: now(),
+    service: 'amazon-uk-api-detector',
     event,
     ...details
   }));
 }
 
-if (!BASE) {
-  throw new Error('API_BASE_URL is required');
+function randomBetween(min, max) {
+  return Math.floor(
+    Math.random() * (max - min + 1)
+  ) + min;
 }
 
-const baseURL = new URL(BASE);
-
-if (
-  baseURL.protocol !== 'https:' ||
-  !['jobsatamazon.co.uk',
-     'www.jobsatamazon.co.uk']
-    .includes(baseURL.hostname)
-) {
-  throw new Error(
-    'API_BASE_URL must be the official UK hourly domain'
+function nextInterval() {
+  return randomBetween(
+    CONFIG.minScan,
+    CONFIG.maxScan
   );
 }
+
+function parseVariables() {
+  try {
+    const data = JSON.parse(
+      E.GRAPHQL_VARIABLES || '{}'
+    );
+
+    if (!data || typeof data !== 'object' ||
+        Array.isArray(data)) {
+      throw new Error('Expected JSON object');
+    }
+
+    return data;
+  } catch (error) {
+    throw new Error(
+      'Invalid GRAPHQL_VARIABLES: ' + error.message
+    );
+  }
+}
+
+function validateAPIPath(value) {
+  const url = new URL(value, BASE_URL);
+
+  if (
+    url.protocol !== 'https:' ||
+    url.hostname !== 'www.jobsatamazon.co.uk'
+  ) {
+    throw new Error(
+      'API endpoint must remain on jobsatamazon.co.uk'
+    );
+  }
+
+  return url.href;
+}
+
+const ENDPOINTS = {
+  csrf: validateAPIPath(CONFIG.csrfPath),
+  authorize: validateAPIPath(CONFIG.authorizePath),
+  graphql: validateAPIPath(CONFIG.graphqlPath)
+};
+
+const status = {
+  service: 'amazon-uk-api-detector',
+  startedAt: now(),
+  source: BASE_URL,
+  mode: 'graphql',
+  state: 'starting',
+
+  initialized: false,
+  paused: false,
+  security: null,
+
+  lastHTTP: null,
+  lastScan: null,
+  lastError: null,
+
+  visibleJobs: 0,
+  totalSeen: 0,
+  lastNewJobs: 0,
+
+  nextScan: null,
+  consecutiveFailures: 0,
+
+  websocketPort: CONFIG.wsPort
+};
+
+let stopping = false;
+let scanning = false;
+let timer = null;
+let initialized = false;
+let csrfToken = null;
+let baselineComplete = false;
+
+const seen = new Map();
+
+// ----------------------------------------------------
+// Persistent duplicate detection
+// ----------------------------------------------------
+
+function loadState() {
+  if (!fs.existsSync(CONFIG.stateFile)) {
+    log('state_file_missing', {
+      note: 'Memory-only deduplication until an existing state file is available'
+    });
+    return;
+  }
+
+  const parsed = JSON.parse(
+    fs.readFileSync(CONFIG.stateFile, 'utf8')
+  );
+
+  if (Array.isArray(parsed.jobs)) {
+    for (const job of parsed.jobs) {
+      if (job?.jobId) {
+        seen.set(String(job.jobId), job);
+      }
+    }
+  } else if (Array.isArray(parsed.ids)) {
+    for (const id of parsed.ids) {
+      seen.set(String(id), {
+        jobId: String(id)
+      });
+    }
+  } else {
+    throw new Error('Unsupported seen_jobs.json structure');
+  }
+
+  baselineComplete = true;
+  status.totalSeen = seen.size;
+
+  log('state_loaded', {
+    jobs: seen.size
+  });
+}
+
+function saveState() {
+  // Respect the requirement not to create new files.
+  if (!fs.existsSync(CONFIG.stateFile)) {
+    return;
+  }
+
+  const data = JSON.stringify({
+    version: 1,
+    updatedAt: now(),
+    jobs: [...seen.values()]
+  }, null, 2);
+
+  fs.writeFileSync(
+    CONFIG.stateFile,
+    data,
+    { mode: 0o600 }
+  );
+}
+
+// ----------------------------------------------------
+// HTTP client with automatic in-memory cookie handling
+// ----------------------------------------------------
 
 const jar = new CookieJar();
 
 const client = wrapper(axios.create({
-  baseURL: baseURL.origin,
+  timeout: CONFIG.requestTimeout,
   jar,
   withCredentials: true,
-  timeout: TIMEOUT_MS,
   maxRedirects: 0,
+
   validateStatus: () => true,
+
   headers: {
-    Accept: 'application/json'
+    Accept: 'application/json',
+    'Accept-Language': 'en-GB,en;q=0.9'
   }
 }));
 
-let csrfToken = null;
-let sessionReady = false;
-let stopping = false;
-let blocked = false;
+function assertResponse(response, operation) {
+  status.lastHTTP = response.status;
 
-const seen = new Set();
-
-function assertAccess(response, operation) {
-  const status = response.status;
-
-  if (status === 403 || status === 429) {
-    blocked = true;
-
+  if (
+    response.status === 403 ||
+    response.status === 429
+  ) {
     const error = new Error(
-      `${operation}: access refused (HTTP ${status})`
+      `${operation}: HTTP ${response.status} access refused`
     );
 
-    error.code = 'ACCESS_REFUSED';
+    error.accessRestricted = true;
+    error.status = response.status;
+
     throw error;
   }
 
-  if (status >= 300 && status < 400) {
+  if (response.status === 401) {
+    const error = new Error(
+      `${operation}: authorization required`
+    );
+
+    error.sessionExpired = true;
+    error.status = 401;
+
+    throw error;
+  }
+
+  if (
+    response.status >= 300 &&
+    response.status < 400
+  ) {
     throw new Error(
-      `${operation}: redirect received; authorization may require interactive login`
+      `${operation}: redirect received; interactive authorization may be required`
     );
   }
 
-  if (status < 200 || status >= 300) {
+  if (
+    response.status < 200 ||
+    response.status >= 300
+  ) {
     const error = new Error(
-      `${operation}: HTTP ${status}`
+      `${operation}: HTTP ${response.status}`
     );
 
-    error.status = status;
+    error.status = response.status;
     throw error;
   }
 
@@ -105,137 +294,202 @@ function assertAccess(response, operation) {
 }
 
 async function initializeSession() {
+  status.state = 'initializing';
+
   log('session_initializing');
 
-  // Cookies are automatically retained in the cookie jar.
-  const csrfResponse = await client.get(CSRF_PATH);
+  const csrfResponse = await client.get(
+    ENDPOINTS.csrf
+  );
 
-  const csrfData = assertAccess(
+  const csrfData = assertResponse(
     csrfResponse,
-    'CSRF initialization'
+    'csrf'
   );
 
-  const cookie = E.CSRF_COOKIE_NAME
-    ? await jar.getCookies(baseURL.origin)
-    : [];
+  let cookieToken = null;
 
-  const matchingCookie = cookie.find(
-    c => c.key === E.CSRF_COOKIE_NAME
-  );
+  if (CONFIG.csrfCookieName) {
+    const cookies = await jar.getCookies(
+      BASE_URL
+    );
 
-  csrfToken =
-    csrfResponse.headers[E.CSRF_RESPONSE_HEADER || 'x-csrf-token'] ||
-    csrfData?.csrfToken ||
-    csrfData?.csrf ||
-    matchingCookie?.value ||
-    null;
-
-  if (E.REQUIRE_CSRF === 'true' && !csrfToken) {
-    throw new Error('CSRF token not returned');
+    cookieToken = cookies.find(
+      cookie =>
+        cookie.key === CONFIG.csrfCookieName
+    )?.value || null;
   }
 
-  // Only works if this endpoint permits noninteractive
-  // access for the current session.
-  const authResponse = await client.get(AUTH_PATH, {
-    headers: csrfToken
-      ? {
-          [E.CSRF_REQUEST_HEADER || 'x-csrf-token']:
-            csrfToken
-        }
-      : {}
+  csrfToken =
+    csrfResponse.headers[
+      CONFIG.csrfResponseHeader.toLowerCase()
+    ] ||
+    csrfData?.csrfToken ||
+    csrfData?.csrf ||
+    cookieToken ||
+    null;
+
+  log('csrf_initialized', {
+    tokenPresent: Boolean(csrfToken)
   });
 
-  assertAccess(authResponse, 'Session authorization');
+  // Authorization is optional and must not be
+  // treated as a way to bypass an interactive login.
+  if (CONFIG.enableAuthorize) {
+    const headers = {};
 
-  sessionReady = true;
+    if (csrfToken) {
+      headers[CONFIG.csrfHeader] = csrfToken;
+    }
+
+    const authorizeResponse = await client.get(
+      ENDPOINTS.authorize,
+      { headers }
+    );
+
+    assertResponse(
+      authorizeResponse,
+      'authorize'
+    );
+
+    log('authorize_completed');
+  }
+
+  initialized = true;
+  status.initialized = true;
 
   log('session_initialized');
 }
 
-function normalizeJob(raw) {
-  if (!raw || typeof raw !== 'object') return null;
+// ----------------------------------------------------
+// GraphQL operations
+// ----------------------------------------------------
 
-  const jobId = String(
-    raw.jobId ??
-    raw.jobID ??
-    raw.job_id ??
-    raw.id ??
-    ''
-  ).trim();
+function readPath(object, fieldPath) {
+  if (!fieldPath) return undefined;
 
-  const title = String(
-    raw.title ??
-    raw.jobTitle ??
-    raw.name ??
-    ''
-  ).trim();
-
-  if (!jobId || !title) return null;
-
-  const value = (...candidates) =>
-    candidates.find(x => x !== undefined &&
-      x !== null && x !== '') ?? null;
-
-  return {
-    jobId,
-    title,
-
-    location: value(
-      raw.location?.city,
-      raw.location?.name,
-      raw.location,
-      raw.city,
-      raw.siteName
-    ),
-
-    postcode: value(
-      raw.postcode,
-      raw.postalCode,
-      raw.zipCode
-    ),
-
-    payRate: value(
-      raw.payRate,
-      raw.hourlyPay,
-      raw.compensation?.display
-    ),
-
-    shiftDetails: value(
-      raw.shiftDetails,
-      raw.shifts,
-      raw.schedule
-    ),
-
-    applyUrl: value(
-      raw.applyUrl,
-      raw.jobUrl,
-      raw.url
-    )
-  };
-}
-
-function readPath(object, dotPath) {
-  return dotPath.split('.').reduce(
-    (value, key) => value?.[key],
+  return fieldPath.split('.').reduce(
+    (current, key) => current?.[key],
     object
   );
 }
 
-async function fetchJobs() {
-  if (!sessionReady) {
+function normalizeText(value) {
+  if (value == null) return null;
+
+  if (typeof value === 'object') {
+    return null;
+  }
+
+  return String(value).trim() || null;
+}
+
+function normalizeJob(raw) {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+
+  const jobId = normalizeText(
+    raw.jobId ??
+    raw.jobID ??
+    raw.job_id ??
+    raw.jobPostingId ??
+    raw.id
+  );
+
+  const title = normalizeText(
+    raw.title ??
+    raw.jobTitle ??
+    raw.name
+  );
+
+  if (!jobId || !title) return null;
+
+  const location = normalizeText(
+    raw.location?.city ??
+    raw.location?.name ??
+    raw.location ??
+    raw.city ??
+    raw.siteName
+  );
+
+  const postcode = normalizeText(
+    raw.postcode ??
+    raw.postalCode ??
+    raw.zipCode ??
+    raw.location?.postcode
+  );
+
+  const payRate = normalizeText(
+    raw.payRate ??
+    raw.hourlyPay ??
+    raw.hourlyRate ??
+    raw.compensation?.display
+  );
+
+  const shiftDetails = normalizeText(
+    raw.shiftDetails ??
+    raw.shift?.name ??
+    raw.shifts ??
+    raw.schedule ??
+    raw.employmentType
+  );
+
+  let applyUrl = null;
+
+  const originalURL =
+    raw.applyUrl ||
+    raw.jobUrl ||
+    raw.url ||
+    null;
+
+  if (originalURL) {
+    try {
+      const url = new URL(
+        originalURL,
+        BASE_URL
+      );
+
+      if (
+        url.protocol === 'https:' &&
+        (
+          url.hostname === 'jobsatamazon.co.uk' ||
+          url.hostname === 'www.jobsatamazon.co.uk'
+        )
+      ) {
+        applyUrl = url.href;
+      }
+    } catch {}
+  }
+
+  return {
+    jobId,
+    title,
+    location,
+    postcode,
+    payRate,
+    shiftDetails,
+    shifts: shiftDetails,
+    applyUrl
+  };
+}
+
+async function queryGraphQL() {
+  if (!initialized) {
     await initializeSession();
   }
 
-  // Supply an actual authorized GraphQL operation.
-  // Never guess the operation name or schema.
-  const query = await fs.readFile(
-    E.GRAPHQL_QUERY_FILE || './jobs.graphql',
-    'utf8'
-  );
+  if (!CONFIG.graphqlQuery) {
+    throw new Error(
+      'GRAPHQL_QUERY is missing from .env'
+    );
+  }
 
-  const variables = E.GRAPHQL_VARIABLES
-    ? JSON.parse(E.GRAPHQL_VARIABLES)
-    : {};
+  if (!CONFIG.graphqlJobsPath) {
+    throw new Error(
+      'GRAPHQL_JOBS_PATH is missing from .env'
+    );
+  }
 
   const headers = {
     'Content-Type': 'application/json',
@@ -243,125 +497,469 @@ async function fetchJobs() {
   };
 
   if (csrfToken) {
-    headers[E.CSRF_REQUEST_HEADER || 'x-csrf-token'] =
-      csrfToken;
+    headers[CONFIG.csrfHeader] = csrfToken;
+  }
+
+  const payload = {
+    query: CONFIG.graphqlQuery,
+    variables: parseVariables()
+  };
+
+  if (CONFIG.graphqlOperation) {
+    payload.operationName =
+      CONFIG.graphqlOperation;
   }
 
   const response = await client.post(
-    GRAPHQL_PATH,
-    {
-      query,
-      variables
-    },
+    ENDPOINTS.graphql,
+    payload,
     { headers }
   );
 
-  const result = assertAccess(
+  const result = assertResponse(
     response,
-    'GraphQL request'
+    'graphql'
   );
 
-  if (Array.isArray(result?.errors) &&
-      result.errors.length) {
+  if (
+    !result ||
+    typeof result !== 'object'
+  ) {
+    throw new Error(
+      'GraphQL response is not a JSON object'
+    );
+  }
+
+  if (
+    Array.isArray(result.errors) &&
+    result.errors.length > 0
+  ) {
     throw new Error(
       `GraphQL returned ${result.errors.length} error(s)`
     );
   }
 
-  const jobsPath = E.GRAPHQL_JOBS_PATH;
+  const rawJobs = readPath(
+    result,
+    CONFIG.graphqlJobsPath
+  );
 
-  if (!jobsPath) {
+  if (!Array.isArray(rawJobs)) {
     throw new Error(
-      'GRAPHQL_JOBS_PATH must identify the job list'
+      `No job array found at ${CONFIG.graphqlJobsPath}`
     );
   }
 
-  const items = readPath(result, jobsPath);
+  const deduplicated = new Map();
 
-  if (!Array.isArray(items)) {
-    throw new Error(
-      `No job array found at ${jobsPath}`
+  for (const raw of rawJobs) {
+    const job = normalizeJob(raw);
+
+    if (!job) continue;
+
+    const previous = deduplicated.get(
+      job.jobId
     );
+
+    if (!previous) {
+      deduplicated.set(job.jobId, job);
+      continue;
+    }
+
+    for (const key of Object.keys(job)) {
+      if (!previous[key] && job[key]) {
+        previous[key] = job[key];
+      }
+    }
   }
 
-  return items.map(normalizeJob).filter(Boolean);
+  return [...deduplicated.values()];
 }
 
-async function processJobs(jobs) {
-  let fresh = 0;
+// ----------------------------------------------------
+// WebSocket server for existing Receiver
+// ----------------------------------------------------
 
-  for (const job of jobs) {
+const wsHttp = http.createServer(
+  (req, res) => {
+    res.writeHead(404).end();
+  }
+);
+
+const wss = new WebSocketServer({
+  noServer: true,
+  maxPayload: 65536
+});
+
+wsHttp.on('upgrade', (req, socket, head) => {
+  if (req.url !== '/') {
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(
+    req,
+    socket,
+    head,
+    ws => {
+      wss.emit('connection', ws, req);
+    }
+  );
+});
+
+wss.on('connection', socket => {
+  log('receiver_connected');
+
+  socket.on('error', error => {
+    log('websocket_error', {
+      error: error.message
+    });
+  });
+
+  socket.send(JSON.stringify({
+    event: 'DETECTOR_CONNECTED',
+    timestamp: now()
+  }));
+});
+
+function broadcast(job) {
+  const payload = JSON.stringify({
+    event: 'NEW_UK_JOB',
+    timestamp: now(),
+    job
+  });
+
+  let clients = 0;
+
+  for (const socket of wss.clients) {
+    if (socket.readyState !== WebSocket.OPEN) {
+      continue;
+    }
+
+    if (socket.bufferedAmount > 1048576) {
+      socket.terminate();
+      continue;
+    }
+
+    socket.send(payload);
+    clients++;
+  }
+
+  return clients;
+}
+
+// ----------------------------------------------------
+// Job processing and deduplication
+// ----------------------------------------------------
+
+function processJobs(incoming) {
+  const fresh = [];
+
+  for (const job of incoming) {
     if (seen.has(job.jobId)) continue;
 
-    seen.add(job.jobId);
-    fresh++;
+    seen.set(job.jobId, {
+      ...job,
+      discoveredAt: now()
+    });
 
-    log('new_job', {
-      job
+    fresh.push(job);
+  }
+
+  saveState();
+
+  status.visibleJobs = incoming.length;
+  status.lastNewJobs = fresh.length;
+  status.totalSeen = seen.size;
+  status.lastScan = now();
+
+  if (
+    baselineComplete ||
+    CONFIG.alertExisting
+  ) {
+    for (const job of fresh) {
+      const clients = broadcast(job);
+
+      log('new_job_detected', {
+        jobId: job.jobId,
+        title: job.title,
+        location: job.location,
+        websocketClients: clients
+      });
+    }
+  } else {
+    log('initial_baseline', {
+      jobs: fresh.length
     });
   }
 
+  baselineComplete = true;
+
   log('scan_complete', {
-    received: jobs.length,
-    newJobs: fresh,
-    seen: seen.size
+    visible: incoming.length,
+    newJobs: fresh.length,
+    totalSeen: seen.size
   });
 }
 
-async function run() {
-  let failures = 0;
+// ----------------------------------------------------
+// Polling, retry and access restrictions
+// ----------------------------------------------------
 
-  while (!stopping && !blocked) {
-    try {
-      const jobs = await fetchJobs();
+function scheduleNext(ms) {
+  if (stopping || status.paused) return;
 
-      await processJobs(jobs);
+  clearTimeout(timer);
 
-      failures = 0;
-    } catch (error) {
-      log('request_failed', {
-        error: error.message,
-        status: error.status || null
-      });
+  status.nextScan = new Date(
+    Date.now() + ms
+  ).toISOString();
 
-      if (error.code === 'ACCESS_REFUSED') {
-        log('access_paused', {
-          reason: 'Server refused API access'
-        });
-        break;
-      }
+  timer = setTimeout(() => {
+    void scan();
+  }, ms);
+}
 
-      // Refresh an expired permitted session once
-      // on a later cycle, without bypassing 403/429.
-      if (error.status === 401) {
-        sessionReady = false;
-        csrfToken = null;
-      }
+function pauseAccess(error) {
+  clearTimeout(timer);
 
-      failures++;
+  initialized = false;
+
+  status.initialized = false;
+  status.paused = true;
+  status.state = 'access_restricted';
+  status.security = 'access_restricted';
+  status.lastError = error.message;
+  status.nextScan = null;
+
+  log('access_paused', {
+    httpStatus: error.status || status.lastHTTP,
+    reason: error.message,
+    manualReviewRequired: true
+  });
+}
+
+async function scan() {
+  if (scanning || stopping || status.paused) {
+    return;
+  }
+
+  scanning = true;
+  status.state = 'scanning';
+  status.nextScan = null;
+
+  try {
+    const jobs = await queryGraphQL();
+
+    processJobs(jobs);
+
+    status.consecutiveFailures = 0;
+    status.lastError = null;
+    status.security = null;
+    status.state = 'monitoring';
+
+    scheduleNext(nextInterval());
+  } catch (error) {
+    if (error.accessRestricted) {
+      pauseAccess(error);
+      return;
+    }
+
+    status.lastError = error.message;
+    status.consecutiveFailures++;
+
+    if (error.sessionExpired) {
+      initialized = false;
+      csrfToken = null;
+      status.initialized = false;
     }
 
     const backoff = Math.min(
-      60 * 60 * 1000,
-      POLL_MS * Math.pow(2, Math.min(failures, 3))
+      CONFIG.maxRetryDelay,
+      nextInterval() *
+        Math.pow(
+          2,
+          Math.min(status.consecutiveFailures, 3)
+        )
     );
 
-    await sleep(backoff);
+    status.state = 'retry_wait';
+
+    log('scan_error', {
+      error: error.message,
+      failures: status.consecutiveFailures,
+      retryInMinutes: Math.round(backoff / 60000)
+    });
+
+    scheduleNext(backoff);
+  } finally {
+    scanning = false;
   }
 }
 
-process.once('SIGTERM', () => {
+// ----------------------------------------------------
+// Health and jobs API
+// ----------------------------------------------------
+
+const server = http.createServer(
+  (req, res) => {
+    const url = new URL(
+      req.url,
+      `http://${CONFIG.host}:${CONFIG.port}`
+    );
+
+    res.setHeader(
+      'Content-Type',
+      'application/json'
+    );
+
+    res.setHeader(
+      'Cache-Control',
+      'no-store'
+    );
+
+    if (
+      url.pathname === '/health' ||
+      url.pathname === '/status'
+    ) {
+      res.writeHead(
+        status.paused ? 503 : 200
+      );
+
+      res.end(JSON.stringify({
+        ...status,
+        uptimeSeconds:
+          Math.floor(process.uptime()),
+        websocketClients:
+          wss.clients.size
+      }));
+
+      return;
+    }
+
+    if (url.pathname === '/jobs') {
+      const rawLimit = Number(
+        url.searchParams.get('limit') || 100
+      );
+
+      const limit = Number.isFinite(rawLimit)
+        ? Math.min(
+            500,
+            Math.max(1, Math.floor(rawLimit))
+          )
+        : 100;
+
+      const values = [...seen.values()];
+
+      res.writeHead(200);
+
+      res.end(JSON.stringify({
+        total: values.length,
+        jobs: values
+          .slice(-limit)
+          .reverse()
+      }));
+
+      return;
+    }
+
+    res.writeHead(404);
+
+    res.end(JSON.stringify({
+      error: 'Not found'
+    }));
+  }
+);
+
+function listen(instance, port, host) {
+  return new Promise((resolve, reject) => {
+    instance.once('error', reject);
+
+    instance.listen(port, host, resolve);
+  });
+}
+
+// ----------------------------------------------------
+// Startup and graceful shutdown
+// ----------------------------------------------------
+
+async function main() {
+  loadState();
+
+  // Configuration must be complete before requests
+  // are sent to the external service.
+  if (!CONFIG.graphqlQuery ||
+      !CONFIG.graphqlJobsPath) {
+    status.state = 'configuration_required';
+    status.lastError =
+      'Set GRAPHQL_QUERY and GRAPHQL_JOBS_PATH';
+  }
+
+  await listen(
+    server,
+    CONFIG.port,
+    CONFIG.host
+  );
+
+  await listen(
+    wsHttp,
+    CONFIG.wsPort,
+    CONFIG.wsHost
+  );
+
+  log('servers_started', {
+    httpPort: CONFIG.port,
+    websocketPort: CONFIG.wsPort,
+    mode: 'graphql'
+  });
+
+  if (!CONFIG.graphqlQuery ||
+      !CONFIG.graphqlJobsPath) {
+    log('configuration_required', {
+      missing: [
+        ...(!CONFIG.graphqlQuery
+          ? ['GRAPHQL_QUERY'] : []),
+        ...(!CONFIG.graphqlJobsPath
+          ? ['GRAPHQL_JOBS_PATH'] : [])
+      ]
+    });
+    return;
+  }
+
+  await scan();
+}
+
+async function shutdown() {
+  if (stopping) return;
+
   stopping = true;
-});
+
+  clearTimeout(timer);
+
+  for (const socket of wss.clients) {
+    socket.terminate();
+  }
+
+  wss.close();
+  wsHttp.close();
+  server.close();
+
+  log('shutdown_complete');
+}
 
 process.once('SIGINT', () => {
-  stopping = true;
+  void shutdown();
 });
 
-run().catch(error => {
-  log('fatal', {
+process.once('SIGTERM', () => {
+  void shutdown();
+});
+
+main().catch(error => {
+  log('fatal_error', {
     error: error.message
   });
 
   process.exitCode = 1;
+  void shutdown();
 });
