@@ -8,47 +8,32 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const E = process.env;
+const env = process.env;
 
-const SITE = 'https://www.jobsatamazon.co.uk';
-const JOB_URL = E.JOB_URL || `${SITE}/app#/jobSearch`;
+const BASE_URL = 'https://www.jobsatamazon.co.uk';
+const SEARCH_URL = `${BASE_URL}/app#/jobSearch`;
 
-const PORT = Number(E.PORT || 5002);
-const WS_PORT = Number(E.WS_PORT || 8082);
-const HOST = E.BIND_HOST || '127.0.0.1';
+const PORT = Number(env.PORT || 5002);
+const WS_PORT = Number(env.WS_PORT || 8082);
+const HOST = env.BIND_HOST || '127.0.0.1';
 
-const MIN_SCAN = Math.max(60000, Number(E.MIN_SCAN_MS || 60000));
-const MAX_SCAN = Math.max(MIN_SCAN, Number(E.MAX_SCAN_MS || 120000));
+const MIN_SCAN_MS = Math.max(
+  60000,
+  Number(env.MIN_SCAN_MS || 60000)
+);
+
+const MAX_SCAN_MS = Math.max(
+  MIN_SCAN_MS,
+  Number(env.MAX_SCAN_MS || 120000)
+);
 
 const STATE_FILE = path.join(ROOT, 'seen_jobs.json');
-
-const log = (event, details = {}) => {
-  console.log(JSON.stringify({
-    time: new Date().toISOString(),
-    service: 'amazon-uk-hourly-detector',
-    event,
-    ...details
-  }));
-};
-
-function validateTarget(value) {
-  const url = new URL(value);
-
-  if (url.protocol !== 'https:' ||
-      !['jobsatamazon.co.uk', 'www.jobsatamazon.co.uk']
-        .includes(url.hostname)) {
-    throw new Error('Only jobsatamazon.co.uk URLs are allowed');
-  }
-
-  return url.href;
-}
-
-const TARGET = validateTarget(JOB_URL);
+const SCAN_TIMEOUT_MS = 30000;
 
 const status = {
   service: 'amazon-uk-hourly-detector',
+  source: SEARCH_URL,
   startedAt: new Date().toISOString(),
-  source: TARGET,
   browser: 'starting',
   paused: false,
   security: null,
@@ -58,42 +43,53 @@ const status = {
   visibleJobs: 0,
   totalSeen: 0,
   lastNewJobs: 0,
-  nextScan: null
+  nextScan: null,
+  pageURL: null,
+  diagnostics: {}
 };
 
-let jobs = new Map();
-let baselineComplete = false;
-let browser = null;
-let context = null;
-let page = null;
-let timer = null;
+let browser;
+let context;
+let page;
+let timer;
 let stopping = false;
 let scanning = false;
+let baselineComplete = false;
 
-function wait(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+const jobs = new Map();
+
+function log(event, details = {}) {
+  console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    service: 'amazon-detector',
+    event,
+    ...details
+  }));
 }
 
-function interval() {
-  return MIN_SCAN +
-    Math.floor(Math.random() * (MAX_SCAN - MIN_SCAN + 1));
+function delay() {
+  return MIN_SCAN_MS +
+    Math.floor(
+      Math.random() *
+      (MAX_SCAN_MS - MIN_SCAN_MS + 1)
+    );
 }
 
 async function loadState() {
   try {
-    const saved = JSON.parse(
+    const data = JSON.parse(
       await fs.readFile(STATE_FILE, 'utf8')
     );
 
-    if (!Array.isArray(saved.jobs)) {
-      throw new Error('Invalid saved state');
+    if (!Array.isArray(data.jobs)) {
+      throw Error('Invalid saved jobs format');
     }
 
-    jobs = new Map(
-      saved.jobs
-        .filter(x => x?.jobId)
-        .map(x => [String(x.jobId), x])
-    );
+    for (const job of data.jobs) {
+      if (job.jobId) {
+        jobs.set(String(job.jobId), job);
+      }
+    }
 
     baselineComplete = true;
   } catch (error) {
@@ -110,7 +106,7 @@ async function saveState() {
     temp,
     JSON.stringify({
       version: 1,
-      savedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
       jobs: [...jobs.values()]
     }, null, 2),
     { mode: 0o600 }
@@ -119,70 +115,33 @@ async function saveState() {
   await fs.rename(temp, STATE_FILE);
 }
 
-const httpServer = http.createServer((req, res) => {
-  const url = new URL(req.url, `http://${HOST}:${PORT}`);
-
-  res.setHeader('Content-Type', 'application/json');
-  res.setHeader('Cache-Control', 'no-store');
-
-  if (url.pathname === '/health' ||
-      url.pathname === '/status') {
-    res.writeHead(status.paused ? 503 : 200);
-    res.end(JSON.stringify({
-      ...status,
-      websocketClients: wss.clients.size,
-      uptimeSeconds: Math.floor(process.uptime())
-    }));
-    return;
-  }
-
-  if (url.pathname === '/jobs') {
-    const limit = Math.min(
-      500,
-      Math.max(1, Number(url.searchParams.get('limit')) || 100)
-    );
-
-    const records = [...jobs.values()]
-      .slice(-limit)
-      .reverse();
-
-    res.writeHead(200);
-    res.end(JSON.stringify({
-      total: jobs.size,
-      jobs: records
-    }));
-    return;
-  }
-
-  res.writeHead(404);
-  res.end(JSON.stringify({ error: 'Not found' }));
-});
-
 const wss = new WebSocketServer({
   noServer: true,
   maxPayload: 65536
 });
 
-const wsHttp = http.createServer((req, res) => {
+const wsHTTP = http.createServer((req, res) => {
   res.writeHead(404).end();
 });
 
-wsHttp.on('upgrade', (req, socket, head) => {
+wsHTTP.on('upgrade', (req, socket, head) => {
   if (req.url !== '/') {
     socket.destroy();
     return;
   }
 
-  wss.handleUpgrade(req, socket, head, ws => {
-    wss.emit('connection', ws, req);
+  wss.handleUpgrade(req, socket, head, client => {
+    wss.emit('connection', client, req);
   });
 });
 
 wss.on('connection', socket => {
   log('receiver_connected');
 
-  socket.on('error', err => {
-    log('receiver_socket_error', { error: err.message });
+  socket.on('error', error => {
+    log('receiver_socket_error', {
+      error: error.message
+    });
   });
 
   socket.send(JSON.stringify({
@@ -192,7 +151,7 @@ wss.on('connection', socket => {
 });
 
 function broadcast(job) {
-  const data = JSON.stringify({
+  const message = JSON.stringify({
     event: 'NEW_UK_JOB',
     timestamp: new Date().toISOString(),
     job
@@ -201,71 +160,191 @@ function broadcast(job) {
   for (const client of wss.clients) {
     if (client.readyState !== WebSocket.OPEN) continue;
 
-    if (client.bufferedAmount > 1024 * 1024) {
+    if (client.bufferedAmount > 1048576) {
       client.terminate();
       continue;
     }
 
-    client.send(data);
+    client.send(message);
   }
 }
 
 async function startBrowser() {
   browser = await chromium.launch({
-    headless: E.HEADLESS !== 'false',
-    chromiumSandbox: E.CHROMIUM_NO_SANDBOX !== 'true'
+    headless: true,
+    chromiumSandbox:
+      env.CHROMIUM_NO_SANDBOX !== 'true'
   });
 
   context = await browser.newContext({
+    viewport: {
+      width: 1366,
+      height: 768
+    },
     locale: 'en-GB',
     timezoneId: 'Europe/London',
-    viewport: { width: 1366, height: 768 },
     acceptDownloads: false
   });
 
   page = await context.newPage();
+
+  // Diagnostics only: record public endpoint response
+  // metadata, never request bodies or session tokens.
+  page.on('response', response => {
+    const url = response.url();
+
+    if (!url.startsWith(BASE_URL)) return;
+
+    if (/graphql|appsync|job|search/i.test(url)) {
+      status.diagnostics.lastNetworkResponse = {
+        path: new URL(url).pathname,
+        httpStatus: response.status(),
+        at: new Date().toISOString()
+      };
+    }
+  });
+
+  page.on('pageerror', error => {
+    status.diagnostics.lastPageError = error.message;
+  });
+
   status.browser = 'ready';
 }
 
-async function extractVisibleJobs() {
-  return await page.evaluate(() => {
-    const clean = value =>
-      String(value || '').replace(/\s+/g, ' ').trim();
+async function navigateSearch() {
+  const response = await page.goto(SEARCH_URL, {
+    waitUntil: 'domcontentloaded',
+    timeout: SCAN_TIMEOUT_MS
+  });
 
-    const selector = [
+  status.lastHTTP = response?.status() ?? null;
+  status.pageURL = page.url();
+
+  if (
+    status.lastHTTP === 403 ||
+    status.lastHTTP === 429
+  ) {
+    status.paused = true;
+    status.security = 'access_restricted';
+    status.browser = 'paused';
+    return false;
+  }
+
+  if (
+    status.lastHTTP === null ||
+    status.lastHTTP < 200 ||
+    status.lastHTTP >= 300
+  ) {
+    throw Error(
+      `Navigation HTTP ${status.lastHTTP}`
+    );
+  }
+
+  // SPA rendering can continue after DOMContentLoaded.
+  // Wait for relevant content, but don't assume jobs exist.
+  await page.waitForFunction(() => {
+    const text = document.body?.innerText || '';
+
+    return (
+      document.querySelectorAll(
+        '[data-job-id],[data-jobid],' +
+        '[data-testid*="job-card" i],' +
+        '[class*="job-card" i]'
+      ).length > 0 ||
+      /no jobs|no results|jobs found|job search/i.test(text)
+    );
+  }, { timeout: 10000 }).catch(() => {});
+
+  return true;
+}
+
+async function checkRestriction() {
+  const text = await page.locator('body')
+    .innerText({ timeout: 5000 })
+    .catch(() => '');
+
+  if (
+    /access denied|access restricted|captcha|unusual traffic/i
+      .test(text.slice(0, 15000))
+  ) {
+    status.paused = true;
+    status.security = 'access_restricted';
+    status.browser = 'paused';
+    return true;
+  }
+
+  return false;
+}
+
+async function extractJobs() {
+  return page.evaluate(() => {
+    const clean = value =>
+      String(value || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    const selectors = [
       '[data-job-id]',
       '[data-jobid]',
       '[data-testid*="job-card" i]',
+      '[data-testid*="job-list" i] article',
       '[class*="job-card" i]',
       '[class*="jobcard" i]',
       '[class*="job-listing" i]'
-    ].join(',');
+    ];
 
-    const cards = [...document.querySelectorAll(selector)];
-    const result = [];
+    const cards = new Set(
+      document.querySelectorAll(selectors.join(','))
+    );
+
+    const results = [];
 
     for (const card of cards) {
-      const text = clean(card.innerText || card.textContent);
-
-      const title = clean(
-        card.querySelector(
-          'h1,h2,h3,h4,[data-testid*="title" i],' +
-          '[class*="job-title" i]'
-        )?.textContent
+      const text = clean(
+        card.innerText || card.textContent
       );
 
-      const link = card.querySelector('a[href]');
+      if (text.length < 8) continue;
 
-      const url = link?.href || '';
+      const titleElement = card.querySelector(
+        'h1,h2,h3,h4,' +
+        '[data-testid*="title" i],' +
+        '[class*="job-title" i]'
+      );
 
-      const jobId = clean(
+      const title = clean(titleElement?.textContent);
+
+      const links = Array.from(
+        card.querySelectorAll('a[href]')
+      );
+
+      const jobLink = links.find(link =>
+        /job|apply|detail/i.test(link.href)
+      );
+
+      const explicitId =
         card.getAttribute('data-job-id') ||
         card.getAttribute('data-jobid') ||
         card.querySelector('[data-job-id]')
-          ?.getAttribute('data-job-id') ||
-        text.match(
-          /(?:Job\s*ID|Job\s*Reference)\s*[:#]?\s*([\w-]+)/i
-        )?.[1]
+          ?.getAttribute('data-job-id');
+
+      const textId = text.match(
+        /\b(?:Job\s*ID|Job\s*Reference)\s*[:#]?\s*([a-z0-9_-]+)/i
+      )?.[1];
+
+      let urlId = null;
+
+      if (jobLink) {
+        const u = new URL(jobLink.href);
+
+        urlId =
+          u.searchParams.get('jobId') ||
+          u.searchParams.get('job_id') ||
+          u.pathname.match(/\/jobs?\/([^/?#]+)/i)?.[1];
+      }
+
+      const jobId = clean(
+        explicitId || textId || urlId
       );
 
       if (!jobId || !title) continue;
@@ -281,7 +360,10 @@ async function extractVisibleJobs() {
         card.querySelector(
           '[data-testid*="postcode" i],' +
           '[class*="postcode" i]'
-        )?.textContent
+        )?.textContent ||
+        text.match(
+          /\b(?:[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b/i
+        )?.[0]
       );
 
       const payRate = clean(
@@ -291,7 +373,7 @@ async function extractVisibleJobs() {
           '[class*="salary" i]'
         )?.textContent ||
         text.match(
-          /£\s*\d+(?:\.\d{1,2})?\s*(?:\/\s*hr|per hour)/i
+          /£\s*\d+(?:\.\d{1,2})?\s*(?:per hour|\/hr|\/hour)/i
         )?.[0]
       );
 
@@ -303,7 +385,7 @@ async function extractVisibleJobs() {
         )?.textContent
       );
 
-      result.push({
+      results.push({
         jobId,
         title,
         location: location || null,
@@ -311,46 +393,69 @@ async function extractVisibleJobs() {
         payRate: payRate || null,
         shiftDetails: shiftDetails || null,
         shifts: shiftDetails || null,
-        applyUrl: url || null
+        applyUrl: jobLink?.href || null
       });
     }
 
-    return result;
+    return {
+      jobs: results,
+      candidateCards: cards.size,
+      pageTitle: document.title,
+      textPreview: clean(
+        document.body?.innerText
+      ).slice(0, 400)
+    };
   });
 }
 
-function normalizeJob(job) {
-  const jobId = String(job.jobId || '').trim();
-  const title = String(job.title || '').trim();
+function normalizeJobs(rawJobs) {
+  const normalized = new Map();
 
-  if (!jobId || !title) return null;
+  for (const raw of rawJobs) {
+    const jobId = String(raw.jobId || '').trim();
+    const title = String(raw.title || '').trim();
 
-  let applyUrl = null;
+    if (!jobId || !title) continue;
 
-  try {
-    if (job.applyUrl) {
-      const url = new URL(job.applyUrl, TARGET);
+    let applyUrl = null;
 
-      if (
-        url.protocol === 'https:' &&
-        ['jobsatamazon.co.uk', 'www.jobsatamazon.co.uk']
-          .includes(url.hostname)
-      ) {
-        applyUrl = url.href;
+    try {
+      if (raw.applyUrl) {
+        const url = new URL(raw.applyUrl, SEARCH_URL);
+
+        if (
+          url.protocol === 'https:' &&
+          (
+            url.hostname === 'jobsatamazon.co.uk' ||
+            url.hostname === 'www.jobsatamazon.co.uk'
+          )
+        ) {
+          applyUrl = url.href;
+        }
       }
-    }
-  } catch {}
+    } catch {}
 
-  return {
-    jobId,
-    title,
-    location: job.location || null,
-    postcode: job.postcode || null,
-    payRate: job.payRate || null,
-    shiftDetails: job.shiftDetails || null,
-    shifts: job.shiftDetails || null,
-    applyUrl
-  };
+    const job = {
+      ...raw,
+      jobId,
+      title,
+      applyUrl
+    };
+
+    const previous = normalized.get(jobId);
+
+    if (previous) {
+      for (const key of Object.keys(job)) {
+        if (!previous[key] && job[key]) {
+          previous[key] = job[key];
+        }
+      }
+    } else {
+      normalized.set(jobId, job);
+    }
+  }
+
+  return [...normalized.values()];
 }
 
 async function scan() {
@@ -358,7 +463,6 @@ async function scan() {
 
   scanning = true;
   status.browser = 'scanning';
-  status.nextScan = null;
 
   try {
     if (!browser?.isConnected()) {
@@ -367,57 +471,32 @@ async function scan() {
       await startBrowser();
     }
 
-    const response = await page.goto(TARGET, {
-      waitUntil: 'domcontentloaded',
-      timeout: 30000
-    });
+    const accessible = await navigateSearch();
 
-    const code = response?.status() ?? 0;
-    status.lastHTTP = code;
-
-    if (code === 403 || code === 429) {
-      status.paused = true;
-      status.security = 'access_restricted';
-      status.browser = 'paused';
-
-      log('access_restricted', { httpStatus: code });
+    if (!accessible || await checkRestriction()) {
+      log('access_restricted', {
+        httpStatus: status.lastHTTP
+      });
       return;
     }
 
-    if (code < 200 || code >= 300) {
-      throw new Error(`Website HTTP ${code}`);
-    }
+    const snapshot = await extractJobs();
+    const found = normalizeJobs(snapshot.jobs);
 
-    await page.waitForTimeout(2000);
+    status.diagnostics = {
+      ...status.diagnostics,
+      candidateCards: snapshot.candidateCards,
+      pageTitle: snapshot.pageTitle,
+      textPreview: snapshot.textPreview
+    };
 
-    const bodyText = await page.locator('body')
-      .innerText({ timeout: 5000 })
-      .catch(() => '');
-
-    if (/access denied|access restricted|captcha|unusual traffic/i
-        .test(bodyText.slice(0, 15000))) {
-      status.paused = true;
-      status.security = 'access_restricted';
-      status.browser = 'paused';
-      return;
-    }
-
-    const extracted = await extractVisibleJobs();
-    const unique = new Map();
-
-    for (const raw of extracted) {
-      const job = normalizeJob(raw);
-      if (job) unique.set(job.jobId, job);
-    }
-
-    const newJobs = [...unique.values()].filter(
+    const fresh = found.filter(
       job => !jobs.has(job.jobId)
     );
 
-    // Persist before sending signals.
     const added = [];
 
-    for (const job of newJobs) {
+    for (const job of fresh) {
       jobs.set(job.jobId, {
         ...job,
         discoveredAt: new Date().toISOString()
@@ -425,22 +504,27 @@ async function scan() {
       added.push(job.jobId);
     }
 
-    try {
-      await saveState();
-    } catch (error) {
-      for (const id of added) jobs.delete(id);
-      throw error;
+    if (added.length) {
+      try {
+        await saveState();
+      } catch (error) {
+        for (const id of added) jobs.delete(id);
+        throw error;
+      }
     }
 
-    status.visibleJobs = unique.size;
+    status.visibleJobs = found.length;
     status.totalSeen = jobs.size;
-    status.lastNewJobs = newJobs.length;
+    status.lastNewJobs = fresh.length;
     status.lastScan = new Date().toISOString();
     status.lastError = null;
     status.browser = 'monitoring';
 
-    if (baselineComplete || E.ALERT_EXISTING === 'true') {
-      for (const job of newJobs) {
+    if (
+      baselineComplete ||
+      env.ALERT_EXISTING === 'true'
+    ) {
+      for (const job of fresh) {
         broadcast(job);
         log('new_job_detected', {
           jobId: job.jobId,
@@ -449,40 +533,92 @@ async function scan() {
         });
       }
     } else {
-      log('initial_baseline', { jobs: newJobs.length });
+      log('initial_baseline', {
+        jobs: fresh.length
+      });
     }
 
     baselineComplete = true;
 
     log('scan_complete', {
-      visible: unique.size,
-      newJobs: newJobs.length,
-      total: jobs.size
+      jobsFound: found.length,
+      newJobs: fresh.length,
+      totalSeen: jobs.size,
+      candidateCards: snapshot.candidateCards
     });
   } catch (error) {
     status.browser = 'error';
     status.lastError = error.message;
-    log('scan_error', { error: error.message });
+
+    log('scan_error', {
+      error: error.message
+    });
   } finally {
     scanning = false;
+    scheduleNext();
   }
 }
 
-async function loop() {
-  while (!stopping && !status.paused) {
-    await scan();
+function scheduleNext() {
+  clearTimeout(timer);
 
-    if (stopping || status.paused) break;
+  if (stopping || status.paused) return;
 
-    const delay = interval();
+  const ms = delay();
 
-    status.nextScan = new Date(
-      Date.now() + delay
-    ).toISOString();
+  status.nextScan = new Date(
+    Date.now() + ms
+  ).toISOString();
 
-    await wait(delay);
-  }
+  timer = setTimeout(() => {
+    void scan();
+  }, ms);
 }
+
+const httpServer = http.createServer((req, res) => {
+  const url = new URL(
+    req.url,
+    `http://${HOST}:${PORT}`
+  );
+
+  res.setHeader('content-type', 'application/json');
+  res.setHeader('cache-control', 'no-store');
+
+  if (
+    url.pathname === '/health' ||
+    url.pathname === '/status'
+  ) {
+    res.writeHead(status.paused ? 503 : 200);
+
+    res.end(JSON.stringify({
+      ...status,
+      websocketClients: wss.clients.size,
+      uptimeSeconds: Math.floor(process.uptime())
+    }));
+    return;
+  }
+
+  if (url.pathname === '/jobs') {
+    const n = Number(url.searchParams.get('limit'));
+
+    const limit = Number.isFinite(n) && n > 0
+      ? Math.min(500, Math.floor(n))
+      : 100;
+
+    res.writeHead(200);
+
+    res.end(JSON.stringify({
+      total: jobs.size,
+      jobs: [...jobs.values()]
+        .slice(-limit)
+        .reverse()
+    }));
+    return;
+  }
+
+  res.writeHead(404);
+  res.end(JSON.stringify({ error: 'Not found' }));
+});
 
 async function listen(server, port) {
   return new Promise((resolve, reject) => {
@@ -495,38 +631,43 @@ async function main() {
   await loadState();
 
   await listen(httpServer, PORT);
-  await listen(wsHttp, WS_PORT);
+  await listen(wsHTTP, WS_PORT);
 
-  log('servers_ready', {
+  log('servers_started', {
     healthPort: PORT,
     websocketPort: WS_PORT,
-    target: TARGET
+    searchURL: SEARCH_URL
   });
 
   await startBrowser();
-  await loop();
+  await scan();
 }
 
 async function shutdown() {
   if (stopping) return;
-  stopping = true;
 
+  stopping = true;
   clearTimeout(timer);
 
-  for (const client of wss.clients) {
-    client.terminate();
+  for (const socket of wss.clients) {
+    socket.terminate();
   }
 
   await context?.close().catch(() => {});
   await browser?.close().catch(() => {});
 
   wss.close();
-  wsHttp.close();
+  wsHTTP.close();
   httpServer.close();
 }
 
-process.once('SIGINT', () => void shutdown());
-process.once('SIGTERM', () => void shutdown());
+process.once('SIGTERM', () => {
+  void shutdown();
+});
+
+process.once('SIGINT', () => {
+  void shutdown();
+});
 
 main().catch(error => {
   log('fatal', { error: error.message });
