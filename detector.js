@@ -1,653 +1,367 @@
 
 import 'dotenv/config';
 
-import { chromium } from 'playwright';
-import { WebSocketServer, WebSocket } from 'ws';
-import http from 'node:http';
-import fs from 'node:fs/promises';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import axios from 'axios';
+import { wrapper } from 'axios-cookiejar-support';
+import { CookieJar } from 'tough-cookie';
 
-const ROOT = path.dirname(fileURLToPath(import.meta.url));
+import fs from 'node:fs/promises';
+
 const E = process.env;
 
-const CONFIG = {
-  url: 'https://www.jobsatamazon.co.uk/app#/jobSearch',
-  httpPort: Number(E.PORT || 5002),
-  wsPort: Number(E.WS_PORT || 8082),
-  host: E.BIND_HOST || '127.0.0.1',
+const BASE = E.API_BASE_URL;
+const CSRF_PATH = E.CSRF_PATH || '/csrf?countryCode=UK';
+const AUTH_PATH = E.AUTH_PATH || '/authorize?countryCode=UK';
+const GRAPHQL_PATH = E.GRAPHQL_PATH || '/graphql';
 
-  minScan: 15 * 60 * 1000,
-  maxScan: 30 * 60 * 1000,
-
-  minDelay: 3000,
-  maxDelay: 7000,
-
-  minCooldown: 60 * 60 * 1000,
-  maxCooldown: 120 * 60 * 1000,
-
-  navigationTimeout: 45000,
-  headless: E.HEADLESS !== 'false',
-  noSandbox: E.CHROMIUM_NO_SANDBOX === 'true',
-
-  stateFile: path.join(ROOT, 'seen_jobs.json')
-};
-
-const now = () => new Date().toISOString();
-
-const random = (min, max) =>
-  Math.floor(Math.random() * (max - min + 1)) + min;
+const TIMEOUT_MS = 20000;
+const POLL_MS = Math.max(
+  15 * 60 * 1000,
+  Number(E.POLL_MS || 900000)
+);
 
 const sleep = ms =>
   new Promise(resolve => setTimeout(resolve, ms));
 
+const now = () => new Date().toISOString();
+
 function log(event, details = {}) {
   console.log(JSON.stringify({
-    time: now(),
-    service: 'amazon-detector',
+    timestamp: now(),
+    service: 'amazon-api-detector',
     event,
     ...details
   }));
 }
 
-const state = {
-  service: 'amazon-uk-hourly-detector',
-  startedAt: now(),
-  source: CONFIG.url,
-  browser: 'starting',
-  paused: false,
-  security: null,
-  lastHTTP: null,
-  lastScan: null,
-  lastError: null,
-  visibleJobs: 0,
-  totalSeen: 0,
-  lastNewJobs: 0,
-  nextScan: null,
-  cooldownUntil: null,
-  pageURL: null,
-  diagnostics: {}
-};
+if (!BASE) {
+  throw new Error('API_BASE_URL is required');
+}
 
-let browser = null;
-let context = null;
-let page = null;
-let timer = null;
+const baseURL = new URL(BASE);
 
-let jobs = new Map();
-let baselineComplete = false;
+if (
+  baseURL.protocol !== 'https:' ||
+  !['jobsatamazon.co.uk',
+     'www.jobsatamazon.co.uk']
+    .includes(baseURL.hostname)
+) {
+  throw new Error(
+    'API_BASE_URL must be the official UK hourly domain'
+  );
+}
+
+const jar = new CookieJar();
+
+const client = wrapper(axios.create({
+  baseURL: baseURL.origin,
+  jar,
+  withCredentials: true,
+  timeout: TIMEOUT_MS,
+  maxRedirects: 0,
+  validateStatus: () => true,
+  headers: {
+    Accept: 'application/json'
+  }
+}));
+
+let csrfToken = null;
+let sessionReady = false;
 let stopping = false;
-let scanning = false;
+let blocked = false;
 
-async function loadState() {
-  try {
-    const saved = JSON.parse(
-      await fs.readFile(CONFIG.stateFile, 'utf8')
+const seen = new Set();
+
+function assertAccess(response, operation) {
+  const status = response.status;
+
+  if (status === 403 || status === 429) {
+    blocked = true;
+
+    const error = new Error(
+      `${operation}: access refused (HTTP ${status})`
     );
 
-    if (!Array.isArray(saved.jobs)) {
-      throw new Error('Invalid state file');
-    }
+    error.code = 'ACCESS_REFUSED';
+    throw error;
+  }
 
-    jobs = new Map(
-      saved.jobs
-        .filter(job => job?.jobId)
-        .map(job => [String(job.jobId), job])
+  if (status >= 300 && status < 400) {
+    throw new Error(
+      `${operation}: redirect received; authorization may require interactive login`
+    );
+  }
+
+  if (status < 200 || status >= 300) {
+    const error = new Error(
+      `${operation}: HTTP ${status}`
     );
 
-    baselineComplete = true;
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
+    error.status = status;
+    throw error;
   }
 
-  state.totalSeen = jobs.size;
+  return response.data;
 }
 
-async function saveState() {
-  const temp = CONFIG.stateFile + '.tmp';
+async function initializeSession() {
+  log('session_initializing');
 
-  await fs.writeFile(
-    temp,
-    JSON.stringify({
-      version: 1,
-      updatedAt: now(),
-      jobs: [...jobs.values()]
-    }, null, 2),
-    { mode: 0o600 }
+  // Cookies are automatically retained in the cookie jar.
+  const csrfResponse = await client.get(CSRF_PATH);
+
+  const csrfData = assertAccess(
+    csrfResponse,
+    'CSRF initialization'
   );
 
-  await fs.rename(temp, CONFIG.stateFile);
-}
+  const cookie = E.CSRF_COOKIE_NAME
+    ? await jar.getCookies(baseURL.origin)
+    : [];
 
-// WebSocket signal server
-const wss = new WebSocketServer({
-  noServer: true,
-  maxPayload: 65536
-});
+  const matchingCookie = cookie.find(
+    c => c.key === E.CSRF_COOKIE_NAME
+  );
 
-const wsHttp = http.createServer((req, res) => {
-  res.writeHead(404).end();
-});
+  csrfToken =
+    csrfResponse.headers[E.CSRF_RESPONSE_HEADER || 'x-csrf-token'] ||
+    csrfData?.csrfToken ||
+    csrfData?.csrf ||
+    matchingCookie?.value ||
+    null;
 
-wsHttp.on('upgrade', (req, socket, head) => {
-  if (req.url !== '/') {
-    socket.destroy();
-    return;
+  if (E.REQUIRE_CSRF === 'true' && !csrfToken) {
+    throw new Error('CSRF token not returned');
   }
 
-  wss.handleUpgrade(req, socket, head, client => {
-    wss.emit('connection', client, req);
-  });
-});
-
-wss.on('connection', socket => {
-  log('receiver_connected');
-
-  socket.on('error', error => {
-    log('socket_error', {
-      error: error.message
-    });
-  });
-
-  socket.send(JSON.stringify({
-    event: 'DETECTOR_CONNECTED',
-    timestamp: now()
-  }));
-});
-
-function broadcast(job) {
-  const payload = JSON.stringify({
-    event: 'NEW_UK_JOB',
-    timestamp: now(),
-    job
-  });
-
-  for (const client of wss.clients) {
-    if (client.readyState !== WebSocket.OPEN) continue;
-
-    if (client.bufferedAmount > 1024 * 1024) {
-      client.terminate();
-      continue;
-    }
-
-    client.send(payload);
-  }
-}
-
-// Browser management
-async function startBrowser() {
-  browser = await chromium.launch({
-    headless: CONFIG.headless,
-    chromiumSandbox: !CONFIG.noSandbox
-  });
-
-  context = await browser.newContext({
-    viewport: {
-      width: 1366,
-      height: 768
-    },
-    locale: 'en-GB',
-    timezoneId: 'Europe/London',
-    acceptDownloads: false
-  });
-
-  page = await context.newPage();
-
-  page.on('pageerror', error => {
-    state.diagnostics.lastPageError = error.message;
-  });
-
-  state.browser = 'ready';
-}
-
-async function closeBrowser() {
-  await context?.close().catch(() => {});
-  await browser?.close().catch(() => {});
-
-  context = null;
-  browser = null;
-  page = null;
-}
-
-async function extractJobs() {
-  return page.evaluate(() => {
-    const clean = value =>
-      String(value || '')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-    const selectors = [
-      '[data-job-id]',
-      '[data-jobid]',
-      '[data-testid*="job-card" i]',
-      '[class*="job-card" i]',
-      '[class*="jobcard" i]',
-      '[class*="job-listing" i]'
-    ].join(',');
-
-    const cards = [
-      ...document.querySelectorAll(selectors)
-    ];
-
-    const result = [];
-
-    for (const card of cards) {
-      const text = clean(
-        card.innerText || card.textContent
-      );
-
-      const title = clean(
-        card.querySelector(
-          'h1,h2,h3,h4,' +
-          '[data-testid*="title" i],' +
-          '[class*="job-title" i]'
-        )?.textContent
-      );
-
-      const link = card.querySelector('a[href]');
-
-      const jobId = clean(
-        card.getAttribute('data-job-id') ||
-        card.getAttribute('data-jobid') ||
-        card.querySelector('[data-job-id]')
-          ?.getAttribute('data-job-id') ||
-        text.match(
-          /(?:Job ID|Job Reference)\s*[:#]?\s*([\w-]+)/i
-        )?.[1]
-      );
-
-      if (!jobId || !title) continue;
-
-      const location = clean(
-        card.querySelector(
-          '[data-testid*="location" i],' +
-          '[class*="location" i]'
-        )?.textContent
-      );
-
-      const postcode = clean(
-        card.querySelector(
-          '[data-testid*="postcode" i],' +
-          '[class*="postcode" i]'
-        )?.textContent
-      );
-
-      const payRate = clean(
-        card.querySelector(
-          '[data-testid*="pay" i],' +
-          '[class*="pay-rate" i],' +
-          '[class*="salary" i]'
-        )?.textContent ||
-        text.match(
-          /£\s*\d+(?:\.\d{1,2})?\s*(?:per hour|\/hr)/i
-        )?.[0]
-      );
-
-      const shiftDetails = clean(
-        card.querySelector(
-          '[data-testid*="shift" i],' +
-          '[class*="shift" i],' +
-          '[class*="schedule" i]'
-        )?.textContent
-      );
-
-      result.push({
-        jobId,
-        title,
-        location: location || null,
-        postcode: postcode || null,
-        payRate: payRate || null,
-        shiftDetails: shiftDetails || null,
-        shifts: shiftDetails || null,
-        applyUrl: link?.href || null
-      });
-    }
-
-    return {
-      jobs: result,
-      candidateCards: cards.length,
-      title: document.title,
-      preview: clean(document.body?.innerText).slice(0, 350)
-    };
-  });
-}
-
-// Pause when access is explicitly refused
-function pauseForRestriction(reason, httpCode = null) {
-  clearTimeout(timer);
-
-  const cooldown = random(
-    CONFIG.minCooldown,
-    CONFIG.maxCooldown
-  );
-
-  state.paused = true;
-  state.browser = 'paused';
-  state.security = reason;
-  state.lastHTTP = httpCode ?? state.lastHTTP;
-
-  state.cooldownUntil = new Date(
-    Date.now() + cooldown
-  ).toISOString();
-
-  state.nextScan = null;
-
-  log('access_restricted', {
-    reason,
-    httpCode,
-    suggestedCooldownUntil: state.cooldownUntil,
-    requiresManualResume: true
-  });
-}
-
-function scheduleNext(delayMs = null) {
-  clearTimeout(timer);
-
-  if (stopping || state.paused) return;
-
-  const ms = delayMs ?? random(
-    CONFIG.minScan,
-    CONFIG.maxScan
-  );
-
-  state.nextScan = new Date(
-    Date.now() + ms
-  ).toISOString();
-
-  log('next_scan_scheduled', {
-    nextScan: state.nextScan,
-    minutes: Math.round(ms / 60000)
-  });
-
-  timer = setTimeout(() => {
-    void scan();
-  }, ms);
-}
-
-async function scan() {
-  if (stopping || scanning || state.paused) return;
-
-  scanning = true;
-  state.browser = 'scanning';
-  state.nextScan = null;
-
-  let transientFailure = false;
-
-  try {
-    if (!browser?.isConnected()) {
-      await closeBrowser();
-      await startBrowser();
-    }
-
-    // Spacing between application actions
-    await sleep(random(
-      CONFIG.minDelay,
-      CONFIG.maxDelay
-    ));
-
-    const response = await page.goto(CONFIG.url, {
-      waitUntil: 'domcontentloaded',
-      timeout: CONFIG.navigationTimeout
-    });
-
-    state.lastHTTP = response?.status() ?? null;
-    state.pageURL = page.url();
-
-    if (
-      state.lastHTTP === 403 ||
-      state.lastHTTP === 429
-    ) {
-      pauseForRestriction(
-        'access_restricted',
-        state.lastHTTP
-      );
-      return;
-    }
-
-    if (
-      !response ||
-      !response.ok()
-    ) {
-      throw new Error(
-        `Website HTTP ${state.lastHTTP}`
-      );
-    }
-
-    // Allow the SPA to render its public search results.
-    await sleep(random(
-      CONFIG.minDelay,
-      CONFIG.maxDelay
-    ));
-
-    const body = await page.locator('body')
-      .innerText({ timeout: 5000 })
-      .catch(() => '');
-
-    if (
-      /access denied|access restricted|captcha|unusual traffic/i
-        .test(body.slice(0, 15000))
-    ) {
-      pauseForRestriction(
-        'restriction_page'
-      );
-      return;
-    }
-
-    const snapshot = await extractJobs();
-
-    const found = new Map();
-
-    for (const job of snapshot.jobs) {
-      const id = String(job.jobId || '').trim();
-      if (!id || !job.title) continue;
-
-      // Restrict job links to official hourly domain.
-      if (job.applyUrl) {
-        try {
-          const u = new URL(job.applyUrl, CONFIG.url);
-          const valid =
-            u.protocol === 'https:' &&
-            (
-              u.hostname === 'jobsatamazon.co.uk' ||
-              u.hostname === 'www.jobsatamazon.co.uk'
-            );
-
-          job.applyUrl = valid ? u.href : null;
-        } catch {
-          job.applyUrl = null;
+  // Only works if this endpoint permits noninteractive
+  // access for the current session.
+  const authResponse = await client.get(AUTH_PATH, {
+    headers: csrfToken
+      ? {
+          [E.CSRF_REQUEST_HEADER || 'x-csrf-token']:
+            csrfToken
         }
-      }
+      : {}
+  });
 
-      found.set(id, { ...job, jobId: id });
-    }
+  assertAccess(authResponse, 'Session authorization');
 
-    const newJobs = [
-      ...found.values()
-    ].filter(job => !jobs.has(job.jobId));
+  sessionReady = true;
 
-    const ids = [];
-
-    for (const job of newJobs) {
-      jobs.set(job.jobId, {
-        ...job,
-        discoveredAt: now()
-      });
-
-      ids.push(job.jobId);
-    }
-
-    if (ids.length > 0) {
-      try {
-        await saveState();
-      } catch (error) {
-        for (const id of ids) jobs.delete(id);
-        throw error;
-      }
-    }
-
-    state.visibleJobs = found.size;
-    state.totalSeen = jobs.size;
-    state.lastNewJobs = newJobs.length;
-    state.lastScan = now();
-    state.lastError = null;
-    state.security = null;
-    state.browser = 'monitoring';
-
-    state.diagnostics = {
-      candidateCards: snapshot.candidateCards,
-      pageTitle: snapshot.title,
-      textPreview: snapshot.preview
-    };
-
-    if (
-      baselineComplete ||
-      E.ALERT_EXISTING === 'true'
-    ) {
-      for (const job of newJobs) {
-        broadcast(job);
-
-        log('new_job_detected', {
-          jobId: job.jobId,
-          title: job.title,
-          location: job.location
-        });
-      }
-    } else {
-      log('initial_baseline', {
-        jobs: newJobs.length
-      });
-    }
-
-    baselineComplete = true;
-
-    log('scan_complete', {
-      found: found.size,
-      newJobs: newJobs.length,
-      totalSeen: jobs.size
-    });
-  } catch (error) {
-    transientFailure = true;
-
-    state.browser = 'error';
-    state.lastError = error.message;
-
-    log('scan_failed', {
-      error: error.message
-    });
-  } finally {
-    scanning = false;
-
-    if (!stopping && !state.paused) {
-      // Network errors get a much longer retry interval.
-      scheduleNext(
-        transientFailure
-          ? random(
-              CONFIG.minCooldown,
-              CONFIG.maxCooldown
-            )
-          : null
-      );
-    }
-  }
+  log('session_initialized');
 }
 
-// Health and job APIs
-const healthServer = http.createServer((req, res) => {
-  const url = new URL(
-    req.url,
-    `http://${CONFIG.host}:${CONFIG.httpPort}`
+function normalizeJob(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+
+  const jobId = String(
+    raw.jobId ??
+    raw.jobID ??
+    raw.job_id ??
+    raw.id ??
+    ''
+  ).trim();
+
+  const title = String(
+    raw.title ??
+    raw.jobTitle ??
+    raw.name ??
+    ''
+  ).trim();
+
+  if (!jobId || !title) return null;
+
+  const value = (...candidates) =>
+    candidates.find(x => x !== undefined &&
+      x !== null && x !== '') ?? null;
+
+  return {
+    jobId,
+    title,
+
+    location: value(
+      raw.location?.city,
+      raw.location?.name,
+      raw.location,
+      raw.city,
+      raw.siteName
+    ),
+
+    postcode: value(
+      raw.postcode,
+      raw.postalCode,
+      raw.zipCode
+    ),
+
+    payRate: value(
+      raw.payRate,
+      raw.hourlyPay,
+      raw.compensation?.display
+    ),
+
+    shiftDetails: value(
+      raw.shiftDetails,
+      raw.shifts,
+      raw.schedule
+    ),
+
+    applyUrl: value(
+      raw.applyUrl,
+      raw.jobUrl,
+      raw.url
+    )
+  };
+}
+
+function readPath(object, dotPath) {
+  return dotPath.split('.').reduce(
+    (value, key) => value?.[key],
+    object
+  );
+}
+
+async function fetchJobs() {
+  if (!sessionReady) {
+    await initializeSession();
+  }
+
+  // Supply an actual authorized GraphQL operation.
+  // Never guess the operation name or schema.
+  const query = await fs.readFile(
+    E.GRAPHQL_QUERY_FILE || './jobs.graphql',
+    'utf8'
   );
 
-  res.setHeader('Content-Type', 'application/json');
-  res.setHeader('Cache-Control', 'no-store');
+  const variables = E.GRAPHQL_VARIABLES
+    ? JSON.parse(E.GRAPHQL_VARIABLES)
+    : {};
 
-  if (
-    url.pathname === '/health' ||
-    url.pathname === '/status'
-  ) {
-    res.writeHead(state.paused ? 503 : 200);
+  const headers = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json'
+  };
 
-    res.end(JSON.stringify({
-      ...state,
-      websocketClients: wss.clients.size,
-      uptimeSeconds: Math.floor(process.uptime())
-    }));
-
-    return;
+  if (csrfToken) {
+    headers[E.CSRF_REQUEST_HEADER || 'x-csrf-token'] =
+      csrfToken;
   }
 
-  if (url.pathname === '/jobs') {
-    const n = Number(url.searchParams.get('limit'));
+  const response = await client.post(
+    GRAPHQL_PATH,
+    {
+      query,
+      variables
+    },
+    { headers }
+  );
 
-    const limit = Number.isFinite(n) && n > 0
-      ? Math.min(500, Math.floor(n))
-      : 100;
+  const result = assertAccess(
+    response,
+    'GraphQL request'
+  );
 
-    res.writeHead(200);
-
-    res.end(JSON.stringify({
-      total: jobs.size,
-      jobs: [...jobs.values()]
-        .slice(-limit)
-        .reverse()
-    }));
-
-    return;
+  if (Array.isArray(result?.errors) &&
+      result.errors.length) {
+    throw new Error(
+      `GraphQL returned ${result.errors.length} error(s)`
+    );
   }
 
-  res.writeHead(404);
-  res.end(JSON.stringify({
-    error: 'Not found'
-  }));
+  const jobsPath = E.GRAPHQL_JOBS_PATH;
+
+  if (!jobsPath) {
+    throw new Error(
+      'GRAPHQL_JOBS_PATH must identify the job list'
+    );
+  }
+
+  const items = readPath(result, jobsPath);
+
+  if (!Array.isArray(items)) {
+    throw new Error(
+      `No job array found at ${jobsPath}`
+    );
+  }
+
+  return items.map(normalizeJob).filter(Boolean);
+}
+
+async function processJobs(jobs) {
+  let fresh = 0;
+
+  for (const job of jobs) {
+    if (seen.has(job.jobId)) continue;
+
+    seen.add(job.jobId);
+    fresh++;
+
+    log('new_job', {
+      job
+    });
+  }
+
+  log('scan_complete', {
+    received: jobs.length,
+    newJobs: fresh,
+    seen: seen.size
+  });
+}
+
+async function run() {
+  let failures = 0;
+
+  while (!stopping && !blocked) {
+    try {
+      const jobs = await fetchJobs();
+
+      await processJobs(jobs);
+
+      failures = 0;
+    } catch (error) {
+      log('request_failed', {
+        error: error.message,
+        status: error.status || null
+      });
+
+      if (error.code === 'ACCESS_REFUSED') {
+        log('access_paused', {
+          reason: 'Server refused API access'
+        });
+        break;
+      }
+
+      // Refresh an expired permitted session once
+      // on a later cycle, without bypassing 403/429.
+      if (error.status === 401) {
+        sessionReady = false;
+        csrfToken = null;
+      }
+
+      failures++;
+    }
+
+    const backoff = Math.min(
+      60 * 60 * 1000,
+      POLL_MS * Math.pow(2, Math.min(failures, 3))
+    );
+
+    await sleep(backoff);
+  }
+}
+
+process.once('SIGTERM', () => {
+  stopping = true;
 });
 
-async function listen(server, port) {
-  return new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, CONFIG.host, resolve);
-  });
-}
-
-async function main() {
-  await loadState();
-
-  await listen(healthServer, CONFIG.httpPort);
-  await listen(wsHttp, CONFIG.wsPort);
-
-  log('servers_started', {
-    httpPort: CONFIG.httpPort,
-    wsPort: CONFIG.wsPort,
-    source: CONFIG.url
-  });
-
-  await startBrowser();
-  await scan();
-}
-
-async function shutdown() {
-  if (stopping) return;
-
+process.once('SIGINT', () => {
   stopping = true;
-  clearTimeout(timer);
+});
 
-  for (const socket of wss.clients) {
-    socket.terminate();
-  }
+run().catch(error => {
+  log('fatal', {
+    error: error.message
+  });
 
-  await closeBrowser();
-
-  wss.close();
-  wsHttp.close();
-  healthServer.close();
-
-  log('shutdown_complete');
-}
-
-process.once('SIGINT', () => void shutdown());
-process.once('SIGTERM', () => void shutdown());
-
-main().catch(error => {
-  log('fatal', { error: error.message });
   process.exitCode = 1;
-  void shutdown();
 });
