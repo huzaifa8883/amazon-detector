@@ -17,222 +17,193 @@ const E = process.env;
 const BASE_URL = 'https://www.jobsatamazon.co.uk';
 
 const CONFIG = {
-  port: Number(E.PORT || 5002),
-  host: E.BIND_HOST || '127.0.0.1',
-
+  httpPort: Number(E.PORT || 5002),
   wsPort: Number(E.WS_PORT || 8082),
-  wsHost: E.WS_HOST || '127.0.0.1',
+  host: '127.0.0.1',
 
   csrfPath: E.CSRF_PATH || '/csrf?countryCode=UK',
-  authorizePath:
-    E.AUTH_PATH || '/authorize?countryCode=UK',
+  authPath: E.AUTH_PATH || '/authorize?countryCode=UK',
   graphqlPath: E.GRAPHQL_PATH || '/graphql',
 
-  // The actual GraphQL operation must be supplied.
-  graphqlQuery: E.GRAPHQL_QUERY || '',
-  graphqlOperation: E.GRAPHQL_OPERATION || '',
-  graphqlJobsPath: E.GRAPHQL_JOBS_PATH || '',
+  csrfHeader: E.CSRF_HEADER || 'x-csrf-token',
+  authorizeEnabled: E.ENABLE_AUTHORIZE === 'true',
 
-  minScan: Math.max(
-    900000,
-    Number(E.MIN_SCAN_MS || 900000)
-  ),
+  jobQuery: E.GRAPHQL_JOB_QUERY || '',
+  jobOperation: E.GRAPHQL_JOB_OPERATION || '',
+  jobResultPath: E.GRAPHQL_JOBS_PATH || '',
 
-  maxScan: Math.max(
-    1800000,
-    Number(E.MAX_SCAN_MS || 1800000)
-  ),
+  minScan: 15 * 60 * 1000,
+  maxScan: 30 * 60 * 1000,
 
-  requestTimeout: 25000,
+  timeout: 25000,
 
-  maxRetryDelay: 3600000,
+  alertExisting: E.ALERT_EXISTING === 'true',
 
-  csrfHeader:
-    E.CSRF_REQUEST_HEADER || 'x-csrf-token',
-
-  csrfResponseHeader:
-    E.CSRF_RESPONSE_HEADER || 'x-csrf-token',
-
-  csrfCookieName: E.CSRF_COOKIE_NAME || '',
-
-  enableAuthorize:
-    E.ENABLE_AUTHORIZE === 'true',
-
-  alertExisting:
-    E.ALERT_EXISTING === 'true',
-
+  // Existing file only; never create it.
   stateFile: path.join(ROOT, 'seen_jobs.json')
 };
+
+const GEO_QUERY = `
+query queryGeoInfoByAddress(
+  $geoAddressQueryRequest: GeoAddressQueryRequest!
+) {
+  queryGeoInfoByAddress(
+    geoAddressQueryRequest: $geoAddressQueryRequest
+  ) {
+    country
+    lat
+    lng
+    postalCode
+    label
+    municipality
+    region
+    subRegion
+    addressNumber
+    __typename
+  }
+}
+`;
 
 const now = () => new Date().toISOString();
 
 function log(event, details = {}) {
   console.log(JSON.stringify({
-    time: now(),
-    service: 'amazon-uk-api-detector',
+    timestamp: now(),
+    service: 'amazon-uk-detector',
     event,
     ...details
   }));
 }
 
-function randomBetween(min, max) {
+function randomDelay(min, max) {
   return Math.floor(
     Math.random() * (max - min + 1)
   ) + min;
 }
 
 function nextInterval() {
-  return randomBetween(
+  return randomDelay(
     CONFIG.minScan,
     CONFIG.maxScan
   );
 }
 
-function parseVariables() {
-  try {
-    const data = JSON.parse(
-      E.GRAPHQL_VARIABLES || '{}'
-    );
-
-    if (!data || typeof data !== 'object' ||
-        Array.isArray(data)) {
-      throw new Error('Expected JSON object');
-    }
-
-    return data;
-  } catch (error) {
-    throw new Error(
-      'Invalid GRAPHQL_VARIABLES: ' + error.message
-    );
-  }
+function readJSON(value, fallback = {}) {
+  if (!value) return fallback;
+  return JSON.parse(value);
 }
 
-function validateAPIPath(value) {
-  const url = new URL(value, BASE_URL);
+function endpoint(pathValue) {
+  const u = new URL(pathValue, BASE_URL);
 
   if (
-    url.protocol !== 'https:' ||
-    url.hostname !== 'www.jobsatamazon.co.uk'
+    u.protocol !== 'https:' ||
+    u.hostname !== 'www.jobsatamazon.co.uk'
   ) {
-    throw new Error(
-      'API endpoint must remain on jobsatamazon.co.uk'
-    );
+    throw new Error('Invalid API host');
   }
 
-  return url.href;
+  return u.href;
 }
 
-const ENDPOINTS = {
-  csrf: validateAPIPath(CONFIG.csrfPath),
-  authorize: validateAPIPath(CONFIG.authorizePath),
-  graphql: validateAPIPath(CONFIG.graphqlPath)
+const URLS = {
+  csrf: endpoint(CONFIG.csrfPath),
+  auth: endpoint(CONFIG.authPath),
+  graphql: endpoint(CONFIG.graphqlPath)
 };
 
 const status = {
-  service: 'amazon-uk-api-detector',
-  startedAt: now(),
+  service: 'amazon-uk-hourly-detector',
   source: BASE_URL,
   mode: 'graphql',
+  startedAt: now(),
   state: 'starting',
 
-  initialized: false,
   paused: false,
   security: null,
+  initialized: false,
 
   lastHTTP: null,
   lastScan: null,
   lastError: null,
 
   visibleJobs: 0,
-  totalSeen: 0,
   lastNewJobs: 0,
+  totalSeen: 0,
 
   nextScan: null,
-  consecutiveFailures: 0,
-
   websocketPort: CONFIG.wsPort
 };
 
 let stopping = false;
 let scanning = false;
 let timer = null;
-let initialized = false;
+let sessionReady = false;
 let csrfToken = null;
-let baselineComplete = false;
+let baselineReady = false;
 
 const seen = new Map();
 
-// ----------------------------------------------------
-// Persistent duplicate detection
-// ----------------------------------------------------
+// --------------------------------------------------
+// State management
+// --------------------------------------------------
 
 function loadState() {
   if (!fs.existsSync(CONFIG.stateFile)) {
-    log('state_file_missing', {
-      note: 'Memory-only deduplication until an existing state file is available'
-    });
+    log('state_memory_only');
     return;
   }
 
-  const parsed = JSON.parse(
+  const data = JSON.parse(
     fs.readFileSync(CONFIG.stateFile, 'utf8')
   );
 
-  if (Array.isArray(parsed.jobs)) {
-    for (const job of parsed.jobs) {
+  if (Array.isArray(data.jobs)) {
+    for (const job of data.jobs) {
       if (job?.jobId) {
         seen.set(String(job.jobId), job);
       }
     }
-  } else if (Array.isArray(parsed.ids)) {
-    for (const id of parsed.ids) {
+  } else if (Array.isArray(data.ids)) {
+    for (const id of data.ids) {
       seen.set(String(id), {
         jobId: String(id)
       });
     }
-  } else {
-    throw new Error('Unsupported seen_jobs.json structure');
   }
 
-  baselineComplete = true;
+  baselineReady = true;
   status.totalSeen = seen.size;
-
-  log('state_loaded', {
-    jobs: seen.size
-  });
 }
 
 function saveState() {
-  // Respect the requirement not to create new files.
+  // Never create a new state file.
   if (!fs.existsSync(CONFIG.stateFile)) {
     return;
   }
 
-  const data = JSON.stringify({
-    version: 1,
-    updatedAt: now(),
-    jobs: [...seen.values()]
-  }, null, 2);
-
   fs.writeFileSync(
     CONFIG.stateFile,
-    data,
+    JSON.stringify({
+      version: 1,
+      updatedAt: now(),
+      jobs: [...seen.values()]
+    }, null, 2),
     { mode: 0o600 }
   );
 }
 
-// ----------------------------------------------------
-// HTTP client with automatic in-memory cookie handling
-// ----------------------------------------------------
+// --------------------------------------------------
+// Axios session and cookies
+// --------------------------------------------------
 
 const jar = new CookieJar();
 
-const client = wrapper(axios.create({
-  timeout: CONFIG.requestTimeout,
+const api = wrapper(axios.create({
   jar,
   withCredentials: true,
+  timeout: CONFIG.timeout,
   maxRedirects: 0,
-
   validateStatus: () => true,
 
   headers: {
@@ -241,7 +212,7 @@ const client = wrapper(axios.create({
   }
 }));
 
-function assertResponse(response, operation) {
+function checkResponse(response, operation) {
   status.lastHTTP = response.status;
 
   if (
@@ -249,12 +220,11 @@ function assertResponse(response, operation) {
     response.status === 429
   ) {
     const error = new Error(
-      `${operation}: HTTP ${response.status} access refused`
+      `${operation}: HTTP ${response.status}`
     );
 
-    error.accessRestricted = true;
-    error.status = response.status;
-
+    error.accessBlocked = true;
+    error.httpStatus = response.status;
     throw error;
   }
 
@@ -263,31 +233,17 @@ function assertResponse(response, operation) {
       `${operation}: authorization required`
     );
 
-    error.sessionExpired = true;
-    error.status = 401;
-
+    error.authorizationRequired = true;
     throw error;
-  }
-
-  if (
-    response.status >= 300 &&
-    response.status < 400
-  ) {
-    throw new Error(
-      `${operation}: redirect received; interactive authorization may be required`
-    );
   }
 
   if (
     response.status < 200 ||
     response.status >= 300
   ) {
-    const error = new Error(
+    throw new Error(
       `${operation}: HTTP ${response.status}`
     );
-
-    error.status = response.status;
-    throw error;
   }
 
   return response.data;
@@ -296,108 +252,142 @@ function assertResponse(response, operation) {
 async function initializeSession() {
   status.state = 'initializing';
 
-  log('session_initializing');
+  const response = await api.get(URLS.csrf);
 
-  const csrfResponse = await client.get(
-    ENDPOINTS.csrf
+  const data = checkResponse(
+    response,
+    'CSRF initialization'
   );
-
-  const csrfData = assertResponse(
-    csrfResponse,
-    'csrf'
-  );
-
-  let cookieToken = null;
-
-  if (CONFIG.csrfCookieName) {
-    const cookies = await jar.getCookies(
-      BASE_URL
-    );
-
-    cookieToken = cookies.find(
-      cookie =>
-        cookie.key === CONFIG.csrfCookieName
-    )?.value || null;
-  }
 
   csrfToken =
-    csrfResponse.headers[
-      CONFIG.csrfResponseHeader.toLowerCase()
+    response.headers[
+      CONFIG.csrfHeader.toLowerCase()
     ] ||
-    csrfData?.csrfToken ||
-    csrfData?.csrf ||
-    cookieToken ||
+    data?.csrfToken ||
+    data?.csrf ||
     null;
 
-  log('csrf_initialized', {
-    tokenPresent: Boolean(csrfToken)
-  });
+  // Optional. This only works when the endpoint
+  // permits a noninteractive authorized session.
+  if (CONFIG.authorizeEnabled) {
+    const headers = csrfToken
+      ? { [CONFIG.csrfHeader]: csrfToken }
+      : {};
 
-  // Authorization is optional and must not be
-  // treated as a way to bypass an interactive login.
-  if (CONFIG.enableAuthorize) {
-    const headers = {};
-
-    if (csrfToken) {
-      headers[CONFIG.csrfHeader] = csrfToken;
-    }
-
-    const authorizeResponse = await client.get(
-      ENDPOINTS.authorize,
+    const auth = await api.get(
+      URLS.auth,
       { headers }
     );
 
-    assertResponse(
-      authorizeResponse,
-      'authorize'
-    );
-
-    log('authorize_completed');
+    checkResponse(auth, 'Authorization');
   }
 
-  initialized = true;
+  sessionReady = true;
   status.initialized = true;
 
-  log('session_initialized');
+  log('session_initialized', {
+    csrfPresent: Boolean(csrfToken)
+  });
 }
 
-// ----------------------------------------------------
-// GraphQL operations
-// ----------------------------------------------------
+// --------------------------------------------------
+// GraphQL
+// --------------------------------------------------
 
-function readPath(object, fieldPath) {
-  if (!fieldPath) return undefined;
+async function graphql(
+  query,
+  operationName,
+  variables
+) {
+  if (!sessionReady) {
+    await initializeSession();
+  }
 
-  return fieldPath.split('.').reduce(
-    (current, key) => current?.[key],
-    object
+  const headers = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json'
+  };
+
+  if (csrfToken) {
+    headers[CONFIG.csrfHeader] = csrfToken;
+  }
+
+  const response = await api.post(
+    URLS.graphql,
+    {
+      operationName,
+      query,
+      variables
+    },
+    { headers }
+  );
+
+  const result = checkResponse(
+    response,
+    operationName
+  );
+
+  if (
+    Array.isArray(result?.errors) &&
+    result.errors.length
+  ) {
+    const errors = result.errors.map(
+      e => e.message || 'GraphQL error'
+    );
+
+    throw new Error(errors.join('; '));
+  }
+
+  return result?.data;
+}
+
+async function resolveLocation() {
+  if (!E.GEO_ADDRESS_REQUEST) return null;
+
+  const variables = {
+    geoAddressQueryRequest: readJSON(
+      E.GEO_ADDRESS_REQUEST
+    )
+  };
+
+  const result = await graphql(
+    GEO_QUERY,
+    'queryGeoInfoByAddress',
+    variables
+  );
+
+  return result?.queryGeoInfoByAddress || null;
+}
+
+function getPath(obj, p) {
+  return p.split('.').reduce(
+    (value, key) => value?.[key],
+    obj
   );
 }
 
-function normalizeText(value) {
-  if (value == null) return null;
-
-  if (typeof value === 'object') {
+function text(value) {
+  if (value === null || value === undefined) {
     return null;
   }
+
+  if (typeof value === 'object') return null;
 
   return String(value).trim() || null;
 }
 
 function normalizeJob(raw) {
-  if (!raw || typeof raw !== 'object') {
-    return null;
-  }
+  if (!raw || typeof raw !== 'object') return null;
 
-  const jobId = normalizeText(
+  const jobId = text(
     raw.jobId ??
     raw.jobID ??
     raw.job_id ??
-    raw.jobPostingId ??
-    raw.id
+    raw.id ??
+    raw.jobPostingId
   );
 
-  const title = normalizeText(
+  const title = text(
     raw.title ??
     raw.jobTitle ??
     raw.name
@@ -405,50 +395,44 @@ function normalizeJob(raw) {
 
   if (!jobId || !title) return null;
 
-  const location = normalizeText(
+  const location = text(
+    raw.location?.label ??
     raw.location?.city ??
-    raw.location?.name ??
     raw.location ??
     raw.city ??
     raw.siteName
   );
 
-  const postcode = normalizeText(
+  const postcode = text(
     raw.postcode ??
     raw.postalCode ??
-    raw.zipCode ??
-    raw.location?.postcode
+    raw.location?.postalCode
   );
 
-  const payRate = normalizeText(
+  const payRate = text(
     raw.payRate ??
     raw.hourlyPay ??
     raw.hourlyRate ??
     raw.compensation?.display
   );
 
-  const shiftDetails = normalizeText(
+  const shiftDetails = text(
     raw.shiftDetails ??
     raw.shift?.name ??
-    raw.shifts ??
     raw.schedule ??
     raw.employmentType
   );
 
   let applyUrl = null;
 
-  const originalURL =
-    raw.applyUrl ||
-    raw.jobUrl ||
-    raw.url ||
-    null;
+  try {
+    const value =
+      raw.applyUrl ||
+      raw.jobUrl ||
+      raw.url;
 
-  if (originalURL) {
-    try {
-      const url = new URL(
-        originalURL,
-        BASE_URL
-      );
+    if (value) {
+      const url = new URL(value, BASE_URL);
 
       if (
         url.protocol === 'https:' &&
@@ -459,8 +443,8 @@ function normalizeJob(raw) {
       ) {
         applyUrl = url.href;
       }
-    } catch {}
-  }
+    }
+  } catch {}
 
   return {
     jobId,
@@ -474,217 +458,143 @@ function normalizeJob(raw) {
   };
 }
 
-async function queryGraphQL() {
-  if (!initialized) {
-    await initializeSession();
-  }
-
-  if (!CONFIG.graphqlQuery) {
-    throw new Error(
-      'GRAPHQL_QUERY is missing from .env'
-    );
-  }
-
-  if (!CONFIG.graphqlJobsPath) {
-    throw new Error(
-      'GRAPHQL_JOBS_PATH is missing from .env'
-    );
-  }
-
-  const headers = {
-    'Content-Type': 'application/json',
-    Accept: 'application/json'
-  };
-
-  if (csrfToken) {
-    headers[CONFIG.csrfHeader] = csrfToken;
-  }
-
-  const payload = {
-    query: CONFIG.graphqlQuery,
-    variables: parseVariables()
-  };
-
-  if (CONFIG.graphqlOperation) {
-    payload.operationName =
-      CONFIG.graphqlOperation;
-  }
-
-  const response = await client.post(
-    ENDPOINTS.graphql,
-    payload,
-    { headers }
-  );
-
-  const result = assertResponse(
-    response,
-    'graphql'
-  );
-
+async function fetchJobs() {
   if (
-    !result ||
-    typeof result !== 'object'
+    !CONFIG.jobQuery ||
+    !CONFIG.jobResultPath
   ) {
     throw new Error(
-      'GraphQL response is not a JSON object'
+      'GRAPHQL_JOB_QUERY and GRAPHQL_JOBS_PATH are required'
     );
   }
 
-  if (
-    Array.isArray(result.errors) &&
-    result.errors.length > 0
-  ) {
-    throw new Error(
-      `GraphQL returned ${result.errors.length} error(s)`
-    );
+  // Geographic resolution is optional.
+  if (E.GEO_ADDRESS_REQUEST) {
+    const geo = await resolveLocation();
+
+    log('location_resolved', {
+      country: geo?.country || null,
+      postalCode: geo?.postalCode || null,
+      municipality: geo?.municipality || null
+    });
   }
 
-  const rawJobs = readPath(
-    result,
-    CONFIG.graphqlJobsPath
+  const data = await graphql(
+    CONFIG.jobQuery,
+    CONFIG.jobOperation || undefined,
+    readJSON(E.GRAPHQL_JOB_VARIABLES || '{}')
   );
 
-  if (!Array.isArray(rawJobs)) {
+  // Paths are relative to the GraphQL "data" object.
+  const records = getPath(
+    data,
+    CONFIG.jobResultPath
+  );
+
+  if (!Array.isArray(records)) {
     throw new Error(
-      `No job array found at ${CONFIG.graphqlJobsPath}`
+      `No job array at ${CONFIG.jobResultPath}`
     );
   }
 
-  const deduplicated = new Map();
+  const unique = new Map();
 
-  for (const raw of rawJobs) {
+  for (const raw of records) {
     const job = normalizeJob(raw);
-
     if (!job) continue;
 
-    const previous = deduplicated.get(
-      job.jobId
-    );
+    const previous = unique.get(job.jobId);
 
     if (!previous) {
-      deduplicated.set(job.jobId, job);
-      continue;
-    }
-
-    for (const key of Object.keys(job)) {
-      if (!previous[key] && job[key]) {
-        previous[key] = job[key];
+      unique.set(job.jobId, job);
+    } else {
+      for (const key of Object.keys(job)) {
+        if (!previous[key] && job[key]) {
+          previous[key] = job[key];
+        }
       }
     }
   }
 
-  return [...deduplicated.values()];
+  return [...unique.values()];
 }
 
-// ----------------------------------------------------
-// WebSocket server for existing Receiver
-// ----------------------------------------------------
-
-const wsHttp = http.createServer(
-  (req, res) => {
-    res.writeHead(404).end();
-  }
-);
+// --------------------------------------------------
+// WebSocket — port 8082
+// --------------------------------------------------
 
 const wss = new WebSocketServer({
-  noServer: true,
+  host: CONFIG.host,
+  port: CONFIG.wsPort,
   maxPayload: 65536
-});
-
-wsHttp.on('upgrade', (req, socket, head) => {
-  if (req.url !== '/') {
-    socket.destroy();
-    return;
-  }
-
-  wss.handleUpgrade(
-    req,
-    socket,
-    head,
-    ws => {
-      wss.emit('connection', ws, req);
-    }
-  );
 });
 
 wss.on('connection', socket => {
   log('receiver_connected');
 
-  socket.on('error', error => {
-    log('websocket_error', {
-      error: error.message
-    });
-  });
-
   socket.send(JSON.stringify({
     event: 'DETECTOR_CONNECTED',
     timestamp: now()
   }));
+
+  socket.on('error', error => {
+    log('socket_error', {
+      error: error.message
+    });
+  });
 });
 
 function broadcast(job) {
-  const payload = JSON.stringify({
+  const message = JSON.stringify({
     event: 'NEW_UK_JOB',
     timestamp: now(),
     job
   });
 
-  let clients = 0;
-
   for (const socket of wss.clients) {
-    if (socket.readyState !== WebSocket.OPEN) {
-      continue;
-    }
+    if (socket.readyState !== WebSocket.OPEN) continue;
 
     if (socket.bufferedAmount > 1048576) {
       socket.terminate();
       continue;
     }
 
-    socket.send(payload);
-    clients++;
+    socket.send(message);
   }
-
-  return clients;
 }
 
-// ----------------------------------------------------
-// Job processing and deduplication
-// ----------------------------------------------------
+// --------------------------------------------------
+// Job processing
+// --------------------------------------------------
 
-function processJobs(incoming) {
-  const fresh = [];
+function processJobs(records) {
+  const fresh = records.filter(
+    job => !seen.has(job.jobId)
+  );
 
-  for (const job of incoming) {
-    if (seen.has(job.jobId)) continue;
-
+  for (const job of fresh) {
     seen.set(job.jobId, {
       ...job,
       discoveredAt: now()
     });
-
-    fresh.push(job);
   }
 
   saveState();
 
-  status.visibleJobs = incoming.length;
+  status.visibleJobs = records.length;
   status.lastNewJobs = fresh.length;
   status.totalSeen = seen.size;
   status.lastScan = now();
 
-  if (
-    baselineComplete ||
-    CONFIG.alertExisting
-  ) {
+  if (baselineReady || CONFIG.alertExisting) {
     for (const job of fresh) {
-      const clients = broadcast(job);
+      broadcast(job);
 
       log('new_job_detected', {
         jobId: job.jobId,
         title: job.title,
         location: job.location,
-        websocketClients: clients
+        payRate: job.payRate
       });
     }
   } else {
@@ -693,20 +603,14 @@ function processJobs(incoming) {
     });
   }
 
-  baselineComplete = true;
-
-  log('scan_complete', {
-    visible: incoming.length,
-    newJobs: fresh.length,
-    totalSeen: seen.size
-  });
+  baselineReady = true;
 }
 
-// ----------------------------------------------------
-// Polling, retry and access restrictions
-// ----------------------------------------------------
+// --------------------------------------------------
+// Scan scheduling
+// --------------------------------------------------
 
-function scheduleNext(ms) {
+function schedule(ms) {
   if (stopping || status.paused) return;
 
   clearTimeout(timer);
@@ -720,220 +624,147 @@ function scheduleNext(ms) {
   }, ms);
 }
 
-function pauseAccess(error) {
-  clearTimeout(timer);
-
-  initialized = false;
-
-  status.initialized = false;
-  status.paused = true;
-  status.state = 'access_restricted';
-  status.security = 'access_restricted';
-  status.lastError = error.message;
-  status.nextScan = null;
-
-  log('access_paused', {
-    httpStatus: error.status || status.lastHTTP,
-    reason: error.message,
-    manualReviewRequired: true
-  });
-}
-
 async function scan() {
-  if (scanning || stopping || status.paused) {
-    return;
-  }
+  if (scanning || stopping || status.paused) return;
 
   scanning = true;
   status.state = 'scanning';
-  status.nextScan = null;
 
   try {
-    const jobs = await queryGraphQL();
+    const jobs = await fetchJobs();
 
     processJobs(jobs);
 
-    status.consecutiveFailures = 0;
-    status.lastError = null;
-    status.security = null;
     status.state = 'monitoring';
+    status.lastError = null;
 
-    scheduleNext(nextInterval());
-  } catch (error) {
-    if (error.accessRestricted) {
-      pauseAccess(error);
-      return;
-    }
-
-    status.lastError = error.message;
-    status.consecutiveFailures++;
-
-    if (error.sessionExpired) {
-      initialized = false;
-      csrfToken = null;
-      status.initialized = false;
-    }
-
-    const backoff = Math.min(
-      CONFIG.maxRetryDelay,
-      nextInterval() *
-        Math.pow(
-          2,
-          Math.min(status.consecutiveFailures, 3)
-        )
-    );
-
-    status.state = 'retry_wait';
-
-    log('scan_error', {
-      error: error.message,
-      failures: status.consecutiveFailures,
-      retryInMinutes: Math.round(backoff / 60000)
+    log('scan_complete', {
+      visible: jobs.length,
+      newJobs: status.lastNewJobs
     });
 
-    scheduleNext(backoff);
+    schedule(nextInterval());
+  } catch (error) {
+    status.lastError = error.message;
+
+    if (error.accessBlocked) {
+      status.paused = true;
+      status.security = 'access_restricted';
+      status.state = 'paused';
+      status.nextScan = null;
+
+      log('access_paused', {
+        error: error.message,
+        httpStatus: error.httpStatus
+      });
+    } else {
+      if (error.authorizationRequired) {
+        sessionReady = false;
+        csrfToken = null;
+        status.initialized = false;
+      }
+
+      status.state = 'retry_wait';
+
+      log('scan_failed', {
+        error: error.message
+      });
+
+      schedule(60 * 60 * 1000);
+    }
   } finally {
     scanning = false;
   }
 }
 
-// ----------------------------------------------------
-// Health and jobs API
-// ----------------------------------------------------
+// --------------------------------------------------
+// Health server — port 5002
+// --------------------------------------------------
 
-const server = http.createServer(
-  (req, res) => {
-    const url = new URL(
-      req.url,
-      `http://${CONFIG.host}:${CONFIG.port}`
-    );
+const server = http.createServer((req, res) => {
+  const url = new URL(
+    req.url,
+    `http://${CONFIG.host}:${CONFIG.httpPort}`
+  );
 
-    res.setHeader(
-      'Content-Type',
-      'application/json'
-    );
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Cache-Control', 'no-store');
 
-    res.setHeader(
-      'Cache-Control',
-      'no-store'
-    );
-
-    if (
-      url.pathname === '/health' ||
-      url.pathname === '/status'
-    ) {
-      res.writeHead(
-        status.paused ? 503 : 200
-      );
-
-      res.end(JSON.stringify({
-        ...status,
-        uptimeSeconds:
-          Math.floor(process.uptime()),
-        websocketClients:
-          wss.clients.size
-      }));
-
-      return;
-    }
-
-    if (url.pathname === '/jobs') {
-      const rawLimit = Number(
-        url.searchParams.get('limit') || 100
-      );
-
-      const limit = Number.isFinite(rawLimit)
-        ? Math.min(
-            500,
-            Math.max(1, Math.floor(rawLimit))
-          )
-        : 100;
-
-      const values = [...seen.values()];
-
-      res.writeHead(200);
-
-      res.end(JSON.stringify({
-        total: values.length,
-        jobs: values
-          .slice(-limit)
-          .reverse()
-      }));
-
-      return;
-    }
-
-    res.writeHead(404);
+  if (
+    url.pathname === '/health' ||
+    url.pathname === '/status'
+  ) {
+    res.writeHead(status.paused ? 503 : 200);
 
     res.end(JSON.stringify({
-      error: 'Not found'
+      ...status,
+      websocketClients: wss.clients.size,
+      uptimeSeconds: Math.floor(process.uptime())
     }));
+
+    return;
   }
-);
 
-function listen(instance, port, host) {
-  return new Promise((resolve, reject) => {
-    instance.once('error', reject);
+  if (url.pathname === '/jobs') {
+    const limit = Math.min(
+      500,
+      Math.max(
+        1,
+        Number(url.searchParams.get('limit')) || 100
+      )
+    );
 
-    instance.listen(port, host, resolve);
-  });
-}
+    res.writeHead(200);
 
-// ----------------------------------------------------
-// Startup and graceful shutdown
-// ----------------------------------------------------
+    res.end(JSON.stringify({
+      total: seen.size,
+      jobs: [...seen.values()]
+        .slice(-limit)
+        .reverse()
+    }));
+
+    return;
+  }
+
+  res.writeHead(404);
+  res.end(JSON.stringify({ error: 'Not found' }));
+});
 
 async function main() {
   loadState();
 
-  // Configuration must be complete before requests
-  // are sent to the external service.
-  if (!CONFIG.graphqlQuery ||
-      !CONFIG.graphqlJobsPath) {
-    status.state = 'configuration_required';
-    status.lastError =
-      'Set GRAPHQL_QUERY and GRAPHQL_JOBS_PATH';
-  }
-
-  await listen(
-    server,
-    CONFIG.port,
-    CONFIG.host
-  );
-
-  await listen(
-    wsHttp,
-    CONFIG.wsPort,
-    CONFIG.wsHost
-  );
-
-  log('servers_started', {
-    httpPort: CONFIG.port,
-    websocketPort: CONFIG.wsPort,
-    mode: 'graphql'
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(
+      CONFIG.httpPort,
+      CONFIG.host,
+      resolve
+    );
   });
 
-  if (!CONFIG.graphqlQuery ||
-      !CONFIG.graphqlJobsPath) {
-    log('configuration_required', {
-      missing: [
-        ...(!CONFIG.graphqlQuery
-          ? ['GRAPHQL_QUERY'] : []),
-        ...(!CONFIG.graphqlJobsPath
-          ? ['GRAPHQL_JOBS_PATH'] : [])
-      ]
-    });
+  log('detector_started', {
+    mode: 'graphql',
+    healthPort: CONFIG.httpPort,
+    websocketPort: CONFIG.wsPort
+  });
+
+  if (
+    !CONFIG.jobQuery ||
+    !CONFIG.jobResultPath
+  ) {
+    status.state = 'configuration_required';
+    status.lastError =
+      'Missing GraphQL job operation or result path';
+
+    log('configuration_required');
     return;
   }
 
   await scan();
 }
 
-async function shutdown() {
-  if (stopping) return;
-
+function shutdown() {
   stopping = true;
-
   clearTimeout(timer);
 
   for (const socket of wss.clients) {
@@ -941,25 +772,13 @@ async function shutdown() {
   }
 
   wss.close();
-  wsHttp.close();
   server.close();
-
-  log('shutdown_complete');
 }
 
-process.once('SIGINT', () => {
-  void shutdown();
-});
-
-process.once('SIGTERM', () => {
-  void shutdown();
-});
+process.once('SIGINT', shutdown);
+process.once('SIGTERM', shutdown);
 
 main().catch(error => {
-  log('fatal_error', {
-    error: error.message
-  });
-
+  log('fatal', { error: error.message });
   process.exitCode = 1;
-  void shutdown();
 });
