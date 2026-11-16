@@ -1,6 +1,5 @@
 node_modules/
 .env
-.browser-profile/
-.runtime/
-AmazonJobsKeys/
+seen_jobs.json
+seen_jobs.json.tmp
 *.log
