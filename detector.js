@@ -1,5 +1,6 @@
 
 import 'dotenv/config';
+
 import { chromium } from 'playwright';
 import { WebSocketServer, WebSocket } from 'ws';
 import http from 'node:http';
@@ -8,32 +9,51 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const env = process.env;
+const E = process.env;
 
-const BASE_URL = 'https://www.jobsatamazon.co.uk';
-const SEARCH_URL = `${BASE_URL}/app#/jobSearch`;
+const CONFIG = {
+  url: 'https://www.jobsatamazon.co.uk/app#/jobSearch',
+  httpPort: Number(E.PORT || 5002),
+  wsPort: Number(E.WS_PORT || 8082),
+  host: E.BIND_HOST || '127.0.0.1',
 
-const PORT = Number(env.PORT || 5002);
-const WS_PORT = Number(env.WS_PORT || 8082);
-const HOST = env.BIND_HOST || '127.0.0.1';
+  minScan: 15 * 60 * 1000,
+  maxScan: 30 * 60 * 1000,
 
-const MIN_SCAN_MS = Math.max(
-  60000,
-  Number(env.MIN_SCAN_MS || 60000)
-);
+  minDelay: 3000,
+  maxDelay: 7000,
 
-const MAX_SCAN_MS = Math.max(
-  MIN_SCAN_MS,
-  Number(env.MAX_SCAN_MS || 120000)
-);
+  minCooldown: 60 * 60 * 1000,
+  maxCooldown: 120 * 60 * 1000,
 
-const STATE_FILE = path.join(ROOT, 'seen_jobs.json');
-const SCAN_TIMEOUT_MS = 30000;
+  navigationTimeout: 45000,
+  headless: E.HEADLESS !== 'false',
+  noSandbox: E.CHROMIUM_NO_SANDBOX === 'true',
 
-const status = {
+  stateFile: path.join(ROOT, 'seen_jobs.json')
+};
+
+const now = () => new Date().toISOString();
+
+const random = (min, max) =>
+  Math.floor(Math.random() * (max - min + 1)) + min;
+
+const sleep = ms =>
+  new Promise(resolve => setTimeout(resolve, ms));
+
+function log(event, details = {}) {
+  console.log(JSON.stringify({
+    time: now(),
+    service: 'amazon-detector',
+    event,
+    ...details
+  }));
+}
+
+const state = {
   service: 'amazon-uk-hourly-detector',
-  source: SEARCH_URL,
-  startedAt: new Date().toISOString(),
+  startedAt: now(),
+  source: CONFIG.url,
   browser: 'starting',
   paused: false,
   security: null,
@@ -44,87 +64,72 @@ const status = {
   totalSeen: 0,
   lastNewJobs: 0,
   nextScan: null,
+  cooldownUntil: null,
   pageURL: null,
   diagnostics: {}
 };
 
-let browser;
-let context;
-let page;
-let timer;
+let browser = null;
+let context = null;
+let page = null;
+let timer = null;
+
+let jobs = new Map();
+let baselineComplete = false;
 let stopping = false;
 let scanning = false;
-let baselineComplete = false;
-
-const jobs = new Map();
-
-function log(event, details = {}) {
-  console.log(JSON.stringify({
-    timestamp: new Date().toISOString(),
-    service: 'amazon-detector',
-    event,
-    ...details
-  }));
-}
-
-function delay() {
-  return MIN_SCAN_MS +
-    Math.floor(
-      Math.random() *
-      (MAX_SCAN_MS - MIN_SCAN_MS + 1)
-    );
-}
 
 async function loadState() {
   try {
-    const data = JSON.parse(
-      await fs.readFile(STATE_FILE, 'utf8')
+    const saved = JSON.parse(
+      await fs.readFile(CONFIG.stateFile, 'utf8')
     );
 
-    if (!Array.isArray(data.jobs)) {
-      throw Error('Invalid saved jobs format');
+    if (!Array.isArray(saved.jobs)) {
+      throw new Error('Invalid state file');
     }
 
-    for (const job of data.jobs) {
-      if (job.jobId) {
-        jobs.set(String(job.jobId), job);
-      }
-    }
+    jobs = new Map(
+      saved.jobs
+        .filter(job => job?.jobId)
+        .map(job => [String(job.jobId), job])
+    );
 
     baselineComplete = true;
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
 
-  status.totalSeen = jobs.size;
+  state.totalSeen = jobs.size;
 }
 
 async function saveState() {
-  const temp = STATE_FILE + '.tmp';
+  const temp = CONFIG.stateFile + '.tmp';
 
   await fs.writeFile(
     temp,
     JSON.stringify({
       version: 1,
-      updatedAt: new Date().toISOString(),
+      updatedAt: now(),
       jobs: [...jobs.values()]
     }, null, 2),
     { mode: 0o600 }
   );
 
-  await fs.rename(temp, STATE_FILE);
+  await fs.rename(temp, CONFIG.stateFile);
 }
 
+// WebSocket signal server
 const wss = new WebSocketServer({
   noServer: true,
   maxPayload: 65536
 });
 
-const wsHTTP = http.createServer((req, res) => {
+const wsHttp = http.createServer((req, res) => {
   res.writeHead(404).end();
 });
 
-wsHTTP.on('upgrade', (req, socket, head) => {
+wsHttp.on('upgrade', (req, socket, head) => {
   if (req.url !== '/') {
     socket.destroy();
     return;
@@ -139,41 +144,41 @@ wss.on('connection', socket => {
   log('receiver_connected');
 
   socket.on('error', error => {
-    log('receiver_socket_error', {
+    log('socket_error', {
       error: error.message
     });
   });
 
   socket.send(JSON.stringify({
     event: 'DETECTOR_CONNECTED',
-    timestamp: new Date().toISOString()
+    timestamp: now()
   }));
 });
 
 function broadcast(job) {
-  const message = JSON.stringify({
+  const payload = JSON.stringify({
     event: 'NEW_UK_JOB',
-    timestamp: new Date().toISOString(),
+    timestamp: now(),
     job
   });
 
   for (const client of wss.clients) {
     if (client.readyState !== WebSocket.OPEN) continue;
 
-    if (client.bufferedAmount > 1048576) {
+    if (client.bufferedAmount > 1024 * 1024) {
       client.terminate();
       continue;
     }
 
-    client.send(message);
+    client.send(payload);
   }
 }
 
+// Browser management
 async function startBrowser() {
   browser = await chromium.launch({
-    headless: true,
-    chromiumSandbox:
-      env.CHROMIUM_NO_SANDBOX !== 'true'
+    headless: CONFIG.headless,
+    chromiumSandbox: !CONFIG.noSandbox
   });
 
   context = await browser.newContext({
@@ -188,92 +193,20 @@ async function startBrowser() {
 
   page = await context.newPage();
 
-  // Diagnostics only: record public endpoint response
-  // metadata, never request bodies or session tokens.
-  page.on('response', response => {
-    const url = response.url();
-
-    if (!url.startsWith(BASE_URL)) return;
-
-    if (/graphql|appsync|job|search/i.test(url)) {
-      status.diagnostics.lastNetworkResponse = {
-        path: new URL(url).pathname,
-        httpStatus: response.status(),
-        at: new Date().toISOString()
-      };
-    }
-  });
-
   page.on('pageerror', error => {
-    status.diagnostics.lastPageError = error.message;
+    state.diagnostics.lastPageError = error.message;
   });
 
-  status.browser = 'ready';
+  state.browser = 'ready';
 }
 
-async function navigateSearch() {
-  const response = await page.goto(SEARCH_URL, {
-    waitUntil: 'domcontentloaded',
-    timeout: SCAN_TIMEOUT_MS
-  });
+async function closeBrowser() {
+  await context?.close().catch(() => {});
+  await browser?.close().catch(() => {});
 
-  status.lastHTTP = response?.status() ?? null;
-  status.pageURL = page.url();
-
-  if (
-    status.lastHTTP === 403 ||
-    status.lastHTTP === 429
-  ) {
-    status.paused = true;
-    status.security = 'access_restricted';
-    status.browser = 'paused';
-    return false;
-  }
-
-  if (
-    status.lastHTTP === null ||
-    status.lastHTTP < 200 ||
-    status.lastHTTP >= 300
-  ) {
-    throw Error(
-      `Navigation HTTP ${status.lastHTTP}`
-    );
-  }
-
-  // SPA rendering can continue after DOMContentLoaded.
-  // Wait for relevant content, but don't assume jobs exist.
-  await page.waitForFunction(() => {
-    const text = document.body?.innerText || '';
-
-    return (
-      document.querySelectorAll(
-        '[data-job-id],[data-jobid],' +
-        '[data-testid*="job-card" i],' +
-        '[class*="job-card" i]'
-      ).length > 0 ||
-      /no jobs|no results|jobs found|job search/i.test(text)
-    );
-  }, { timeout: 10000 }).catch(() => {});
-
-  return true;
-}
-
-async function checkRestriction() {
-  const text = await page.locator('body')
-    .innerText({ timeout: 5000 })
-    .catch(() => '');
-
-  if (
-    /access denied|access restricted|captcha|unusual traffic/i
-      .test(text.slice(0, 15000))
-  ) {
-    status.paused = true;
-    status.security = 'access_restricted';
-    status.browser = 'paused';
-    return true;
-  }
-
-  return false;
+  context = null;
+  browser = null;
+  page = null;
 }
 
 async function extractJobs() {
@@ -287,64 +220,40 @@ async function extractJobs() {
       '[data-job-id]',
       '[data-jobid]',
       '[data-testid*="job-card" i]',
-      '[data-testid*="job-list" i] article',
       '[class*="job-card" i]',
       '[class*="jobcard" i]',
       '[class*="job-listing" i]'
+    ].join(',');
+
+    const cards = [
+      ...document.querySelectorAll(selectors)
     ];
 
-    const cards = new Set(
-      document.querySelectorAll(selectors.join(','))
-    );
-
-    const results = [];
+    const result = [];
 
     for (const card of cards) {
       const text = clean(
         card.innerText || card.textContent
       );
 
-      if (text.length < 8) continue;
-
-      const titleElement = card.querySelector(
-        'h1,h2,h3,h4,' +
-        '[data-testid*="title" i],' +
-        '[class*="job-title" i]'
+      const title = clean(
+        card.querySelector(
+          'h1,h2,h3,h4,' +
+          '[data-testid*="title" i],' +
+          '[class*="job-title" i]'
+        )?.textContent
       );
 
-      const title = clean(titleElement?.textContent);
+      const link = card.querySelector('a[href]');
 
-      const links = Array.from(
-        card.querySelectorAll('a[href]')
-      );
-
-      const jobLink = links.find(link =>
-        /job|apply|detail/i.test(link.href)
-      );
-
-      const explicitId =
+      const jobId = clean(
         card.getAttribute('data-job-id') ||
         card.getAttribute('data-jobid') ||
         card.querySelector('[data-job-id]')
-          ?.getAttribute('data-job-id');
-
-      const textId = text.match(
-        /\b(?:Job\s*ID|Job\s*Reference)\s*[:#]?\s*([a-z0-9_-]+)/i
-      )?.[1];
-
-      let urlId = null;
-
-      if (jobLink) {
-        const u = new URL(jobLink.href);
-
-        urlId =
-          u.searchParams.get('jobId') ||
-          u.searchParams.get('job_id') ||
-          u.pathname.match(/\/jobs?\/([^/?#]+)/i)?.[1];
-      }
-
-      const jobId = clean(
-        explicitId || textId || urlId
+          ?.getAttribute('data-job-id') ||
+        text.match(
+          /(?:Job ID|Job Reference)\s*[:#]?\s*([\w-]+)/i
+        )?.[1]
       );
 
       if (!jobId || !title) continue;
@@ -360,10 +269,7 @@ async function extractJobs() {
         card.querySelector(
           '[data-testid*="postcode" i],' +
           '[class*="postcode" i]'
-        )?.textContent ||
-        text.match(
-          /\b(?:[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b/i
-        )?.[0]
+        )?.textContent
       );
 
       const payRate = clean(
@@ -373,7 +279,7 @@ async function extractJobs() {
           '[class*="salary" i]'
         )?.textContent ||
         text.match(
-          /£\s*\d+(?:\.\d{1,2})?\s*(?:per hour|\/hr|\/hour)/i
+          /£\s*\d+(?:\.\d{1,2})?\s*(?:per hour|\/hr)/i
         )?.[0]
       );
 
@@ -385,7 +291,7 @@ async function extractJobs() {
         )?.textContent
       );
 
-      results.push({
+      result.push({
         jobId,
         title,
         location: location || null,
@@ -393,139 +299,213 @@ async function extractJobs() {
         payRate: payRate || null,
         shiftDetails: shiftDetails || null,
         shifts: shiftDetails || null,
-        applyUrl: jobLink?.href || null
+        applyUrl: link?.href || null
       });
     }
 
     return {
-      jobs: results,
-      candidateCards: cards.size,
-      pageTitle: document.title,
-      textPreview: clean(
-        document.body?.innerText
-      ).slice(0, 400)
+      jobs: result,
+      candidateCards: cards.length,
+      title: document.title,
+      preview: clean(document.body?.innerText).slice(0, 350)
     };
   });
 }
 
-function normalizeJobs(rawJobs) {
-  const normalized = new Map();
+// Pause when access is explicitly refused
+function pauseForRestriction(reason, httpCode = null) {
+  clearTimeout(timer);
 
-  for (const raw of rawJobs) {
-    const jobId = String(raw.jobId || '').trim();
-    const title = String(raw.title || '').trim();
+  const cooldown = random(
+    CONFIG.minCooldown,
+    CONFIG.maxCooldown
+  );
 
-    if (!jobId || !title) continue;
+  state.paused = true;
+  state.browser = 'paused';
+  state.security = reason;
+  state.lastHTTP = httpCode ?? state.lastHTTP;
 
-    let applyUrl = null;
+  state.cooldownUntil = new Date(
+    Date.now() + cooldown
+  ).toISOString();
 
-    try {
-      if (raw.applyUrl) {
-        const url = new URL(raw.applyUrl, SEARCH_URL);
+  state.nextScan = null;
 
-        if (
-          url.protocol === 'https:' &&
-          (
-            url.hostname === 'jobsatamazon.co.uk' ||
-            url.hostname === 'www.jobsatamazon.co.uk'
-          )
-        ) {
-          applyUrl = url.href;
-        }
-      }
-    } catch {}
+  log('access_restricted', {
+    reason,
+    httpCode,
+    suggestedCooldownUntil: state.cooldownUntil,
+    requiresManualResume: true
+  });
+}
 
-    const job = {
-      ...raw,
-      jobId,
-      title,
-      applyUrl
-    };
+function scheduleNext(delayMs = null) {
+  clearTimeout(timer);
 
-    const previous = normalized.get(jobId);
+  if (stopping || state.paused) return;
 
-    if (previous) {
-      for (const key of Object.keys(job)) {
-        if (!previous[key] && job[key]) {
-          previous[key] = job[key];
-        }
-      }
-    } else {
-      normalized.set(jobId, job);
-    }
-  }
+  const ms = delayMs ?? random(
+    CONFIG.minScan,
+    CONFIG.maxScan
+  );
 
-  return [...normalized.values()];
+  state.nextScan = new Date(
+    Date.now() + ms
+  ).toISOString();
+
+  log('next_scan_scheduled', {
+    nextScan: state.nextScan,
+    minutes: Math.round(ms / 60000)
+  });
+
+  timer = setTimeout(() => {
+    void scan();
+  }, ms);
 }
 
 async function scan() {
-  if (scanning || stopping || status.paused) return;
+  if (stopping || scanning || state.paused) return;
 
   scanning = true;
-  status.browser = 'scanning';
+  state.browser = 'scanning';
+  state.nextScan = null;
+
+  let transientFailure = false;
 
   try {
     if (!browser?.isConnected()) {
-      await context?.close().catch(() => {});
-      await browser?.close().catch(() => {});
+      await closeBrowser();
       await startBrowser();
     }
 
-    const accessible = await navigateSearch();
+    // Spacing between application actions
+    await sleep(random(
+      CONFIG.minDelay,
+      CONFIG.maxDelay
+    ));
 
-    if (!accessible || await checkRestriction()) {
-      log('access_restricted', {
-        httpStatus: status.lastHTTP
-      });
+    const response = await page.goto(CONFIG.url, {
+      waitUntil: 'domcontentloaded',
+      timeout: CONFIG.navigationTimeout
+    });
+
+    state.lastHTTP = response?.status() ?? null;
+    state.pageURL = page.url();
+
+    if (
+      state.lastHTTP === 403 ||
+      state.lastHTTP === 429
+    ) {
+      pauseForRestriction(
+        'access_restricted',
+        state.lastHTTP
+      );
+      return;
+    }
+
+    if (
+      !response ||
+      !response.ok()
+    ) {
+      throw new Error(
+        `Website HTTP ${state.lastHTTP}`
+      );
+    }
+
+    // Allow the SPA to render its public search results.
+    await sleep(random(
+      CONFIG.minDelay,
+      CONFIG.maxDelay
+    ));
+
+    const body = await page.locator('body')
+      .innerText({ timeout: 5000 })
+      .catch(() => '');
+
+    if (
+      /access denied|access restricted|captcha|unusual traffic/i
+        .test(body.slice(0, 15000))
+    ) {
+      pauseForRestriction(
+        'restriction_page'
+      );
       return;
     }
 
     const snapshot = await extractJobs();
-    const found = normalizeJobs(snapshot.jobs);
 
-    status.diagnostics = {
-      ...status.diagnostics,
-      candidateCards: snapshot.candidateCards,
-      pageTitle: snapshot.pageTitle,
-      textPreview: snapshot.textPreview
-    };
+    const found = new Map();
 
-    const fresh = found.filter(
-      job => !jobs.has(job.jobId)
-    );
+    for (const job of snapshot.jobs) {
+      const id = String(job.jobId || '').trim();
+      if (!id || !job.title) continue;
 
-    const added = [];
+      // Restrict job links to official hourly domain.
+      if (job.applyUrl) {
+        try {
+          const u = new URL(job.applyUrl, CONFIG.url);
+          const valid =
+            u.protocol === 'https:' &&
+            (
+              u.hostname === 'jobsatamazon.co.uk' ||
+              u.hostname === 'www.jobsatamazon.co.uk'
+            );
 
-    for (const job of fresh) {
-      jobs.set(job.jobId, {
-        ...job,
-        discoveredAt: new Date().toISOString()
-      });
-      added.push(job.jobId);
+          job.applyUrl = valid ? u.href : null;
+        } catch {
+          job.applyUrl = null;
+        }
+      }
+
+      found.set(id, { ...job, jobId: id });
     }
 
-    if (added.length) {
+    const newJobs = [
+      ...found.values()
+    ].filter(job => !jobs.has(job.jobId));
+
+    const ids = [];
+
+    for (const job of newJobs) {
+      jobs.set(job.jobId, {
+        ...job,
+        discoveredAt: now()
+      });
+
+      ids.push(job.jobId);
+    }
+
+    if (ids.length > 0) {
       try {
         await saveState();
       } catch (error) {
-        for (const id of added) jobs.delete(id);
+        for (const id of ids) jobs.delete(id);
         throw error;
       }
     }
 
-    status.visibleJobs = found.length;
-    status.totalSeen = jobs.size;
-    status.lastNewJobs = fresh.length;
-    status.lastScan = new Date().toISOString();
-    status.lastError = null;
-    status.browser = 'monitoring';
+    state.visibleJobs = found.size;
+    state.totalSeen = jobs.size;
+    state.lastNewJobs = newJobs.length;
+    state.lastScan = now();
+    state.lastError = null;
+    state.security = null;
+    state.browser = 'monitoring';
+
+    state.diagnostics = {
+      candidateCards: snapshot.candidateCards,
+      pageTitle: snapshot.title,
+      textPreview: snapshot.preview
+    };
 
     if (
       baselineComplete ||
-      env.ALERT_EXISTING === 'true'
+      E.ALERT_EXISTING === 'true'
     ) {
-      for (const job of fresh) {
+      for (const job of newJobs) {
         broadcast(job);
+
         log('new_job_detected', {
           jobId: job.jobId,
           title: job.title,
@@ -534,67 +514,65 @@ async function scan() {
       }
     } else {
       log('initial_baseline', {
-        jobs: fresh.length
+        jobs: newJobs.length
       });
     }
 
     baselineComplete = true;
 
     log('scan_complete', {
-      jobsFound: found.length,
-      newJobs: fresh.length,
-      totalSeen: jobs.size,
-      candidateCards: snapshot.candidateCards
+      found: found.size,
+      newJobs: newJobs.length,
+      totalSeen: jobs.size
     });
   } catch (error) {
-    status.browser = 'error';
-    status.lastError = error.message;
+    transientFailure = true;
 
-    log('scan_error', {
+    state.browser = 'error';
+    state.lastError = error.message;
+
+    log('scan_failed', {
       error: error.message
     });
   } finally {
     scanning = false;
-    scheduleNext();
+
+    if (!stopping && !state.paused) {
+      // Network errors get a much longer retry interval.
+      scheduleNext(
+        transientFailure
+          ? random(
+              CONFIG.minCooldown,
+              CONFIG.maxCooldown
+            )
+          : null
+      );
+    }
   }
 }
 
-function scheduleNext() {
-  clearTimeout(timer);
-
-  if (stopping || status.paused) return;
-
-  const ms = delay();
-
-  status.nextScan = new Date(
-    Date.now() + ms
-  ).toISOString();
-
-  timer = setTimeout(() => {
-    void scan();
-  }, ms);
-}
-
-const httpServer = http.createServer((req, res) => {
+// Health and job APIs
+const healthServer = http.createServer((req, res) => {
   const url = new URL(
     req.url,
-    `http://${HOST}:${PORT}`
+    `http://${CONFIG.host}:${CONFIG.httpPort}`
   );
 
-  res.setHeader('content-type', 'application/json');
-  res.setHeader('cache-control', 'no-store');
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Cache-Control', 'no-store');
 
   if (
     url.pathname === '/health' ||
     url.pathname === '/status'
   ) {
-    res.writeHead(status.paused ? 503 : 200);
+    res.writeHead(state.paused ? 503 : 200);
 
     res.end(JSON.stringify({
-      ...status,
+      ...state,
       websocketClients: wss.clients.size,
       uptimeSeconds: Math.floor(process.uptime())
     }));
+
     return;
   }
 
@@ -613,30 +591,33 @@ const httpServer = http.createServer((req, res) => {
         .slice(-limit)
         .reverse()
     }));
+
     return;
   }
 
   res.writeHead(404);
-  res.end(JSON.stringify({ error: 'Not found' }));
+  res.end(JSON.stringify({
+    error: 'Not found'
+  }));
 });
 
 async function listen(server, port) {
   return new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(port, HOST, resolve);
+    server.listen(port, CONFIG.host, resolve);
   });
 }
 
 async function main() {
   await loadState();
 
-  await listen(httpServer, PORT);
-  await listen(wsHTTP, WS_PORT);
+  await listen(healthServer, CONFIG.httpPort);
+  await listen(wsHttp, CONFIG.wsPort);
 
   log('servers_started', {
-    healthPort: PORT,
-    websocketPort: WS_PORT,
-    searchURL: SEARCH_URL
+    httpPort: CONFIG.httpPort,
+    wsPort: CONFIG.wsPort,
+    source: CONFIG.url
   });
 
   await startBrowser();
@@ -653,21 +634,17 @@ async function shutdown() {
     socket.terminate();
   }
 
-  await context?.close().catch(() => {});
-  await browser?.close().catch(() => {});
+  await closeBrowser();
 
   wss.close();
-  wsHTTP.close();
-  httpServer.close();
+  wsHttp.close();
+  healthServer.close();
+
+  log('shutdown_complete');
 }
 
-process.once('SIGTERM', () => {
-  void shutdown();
-});
-
-process.once('SIGINT', () => {
-  void shutdown();
-});
+process.once('SIGINT', () => void shutdown());
+process.once('SIGTERM', () => void shutdown());
 
 main().catch(error => {
   log('fatal', { error: error.message });
